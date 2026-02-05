@@ -1,0 +1,4 @@
+# Test dependencies for term-cli
+pytest>=7.0.0
+pytest-timeout>=2.0.0
+pytest-xdist>=3.0.0

@@ -1,0 +1,7 @@
+[tool.pyright]
+pythonVersion = "3.8"
+typeCheckingMode = "standard"
+extraPaths = ["tests"]
+
+# Exclude non-Python files that happen to be Python scripts
+include = ["tests/**/*.py"]

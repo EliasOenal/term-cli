@@ -1,0 +1,735 @@
+#!/usr/bin/env python3
+# term-assist — Elias Oenal <termcli@eliasoenal.com>
+#
+# Copyright (c) 2026 Elias Oenal <termcli@eliasoenal.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted (subject to the limitations in the disclaimer
+# below) provided that the following conditions are met:
+#
+# * Redistributions of source code must retain the above copyright notice,
+#   this list of conditions and the following disclaimer.
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+# * Neither the name of term-cli nor the names of its contributors may be used
+#   to endorse or promote products derived from this software without specific
+#   prior written permission.
+#
+# NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
+# THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+# CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT
+# NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+# PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+# CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+# EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+# PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+# OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+# ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+term-assist — Human companion tool for term-cli session sharing
+
+Allows humans to collaborate with AI agents on terminal sessions.
+When attached, terminal dimensions are preserved (agent's TUI apps stay stable).
+
+Requires: tmux on PATH (macOS: brew install tmux)
+
+Exit codes: 0=success, 1=runtime error, 2=invalid input, 127=tmux not found
+
+Quick reference:
+  term-assist list [-a]                # List sessions with requests (-a for all)
+  term-assist attach [-s NAME] [-r]    # Attach with request UI, auto-complete on detach
+  term-assist done [-s NAME] [-m MSG]  # Mark complete, optional message for agent
+  term-assist detach                   # Detach from current session
+  term-assist start -s NAME [options]  # Create session for agent to use later
+  term-assist kill -s NAME             # Kill session
+  term-assist kill -a                  # Kill all sessions
+  term-assist lock [-s NAME]           # Lock session (agent read-only)
+  term-assist unlock [-s NAME]         # Unlock session (agent can interact)
+
+When attached, -s is optional (auto-detected from $TMUX).
+For 'attach', -s defaults to first session with pending request, or first session.
+
+Keybindings when attached:
+  Ctrl+B Enter  = Complete request, stay attached
+  Ctrl+B d      = Detach (also completes request)
+
+Short flags: -s (session), -r (read-only), -x (cols), -y (rows), -c (cwd), -a (all), -l (locked)
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Any
+
+DEFAULT_COLS = 80
+DEFAULT_ROWS = 24
+
+# Exit codes
+EXIT_SUCCESS = 0
+EXIT_RUNTIME_ERROR = 1
+EXIT_INPUT_ERROR = 2
+EXIT_NOT_FOUND = 127
+
+# tmux user option for human assistance requests (shared with term-cli)
+# User options can be used directly in tmux format strings with #{@name} syntax
+TERM_CLI_REQUEST_OPT = "@term_cli_request"
+# tmux user option for human response messages (shared with term-cli)
+TERM_CLI_RESPONSE_OPT = "@term_cli_response"
+# tmux user option to signal human detached without completing request (shared with term-cli)
+TERM_CLI_DETACHED_OPT = "@term_cli_detached"
+# tmux user option to lock session (agent can only observe, not interact)
+TERM_CLI_LOCKED_OPT = "@term_cli_agent_locked"
+
+# Global tmux socket name (set via -L/--socket-name option)
+_tmux_socket: str | None = None
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def _eprint(*args: Any) -> None:
+    print(*args, file=sys.stderr)
+
+
+def _tmux_path() -> str:
+    p = shutil.which("tmux")
+    if not p:
+        raise FileNotFoundError("tmux not found on PATH. Install tmux (macOS: `brew install tmux`).")
+    return p
+
+
+@dataclass
+class CmdResult:
+    ok: bool
+    code: int
+    stdout: str
+    stderr: str
+
+
+def _run_tmux(args: list[str]) -> CmdResult:
+    tmux = _tmux_path()
+    cmd_args = list(args)
+    if _tmux_socket:
+        cmd_args = ["-L", _tmux_socket] + cmd_args
+    proc = subprocess.run(
+        [tmux, *cmd_args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return CmdResult(ok=(proc.returncode == 0), code=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+
+def _session_exists(session: str) -> bool:
+    res = _run_tmux(["has-session", "-t", session])
+    return res.ok
+
+
+def _require_session(session: str) -> None:
+    if not _session_exists(session):
+        raise ValueError(f"Session '{session}' does not exist")
+
+
+def _get_current_session() -> str | None:
+    """Get session name if running inside tmux."""
+    if not os.environ.get("TMUX"):
+        return None
+    res = _run_tmux(["display-message", "-p", "#{session_name}"])
+    if res.ok:
+        return res.stdout.strip()
+    return None
+
+
+def _get_session_or_current(args: argparse.Namespace) -> str:
+    """Get session from args or detect from environment."""
+    if hasattr(args, 'session') and args.session:
+        return args.session
+    current = _get_current_session()
+    if current:
+        return current
+    raise ValueError("Not in a tmux session. Use -s SESSION to specify.")
+
+
+def _get_request(session: str) -> str | None:
+    """Get pending request message for session, or None if no request."""
+    res = _run_tmux(["show-option", "-t", session, "-qv", TERM_CLI_REQUEST_OPT])
+    if res.ok and res.stdout.strip():
+        return res.stdout.strip()
+    return None
+
+
+def _clear_request(session: str) -> None:
+    """Clear pending request for session."""
+    _run_tmux(["set-option", "-t", session, "-u", TERM_CLI_REQUEST_OPT])
+
+
+def _clear_detached(session: str) -> None:
+    """Clear detached flag for session."""
+    _run_tmux(["set-option", "-t", session, "-u", TERM_CLI_DETACHED_OPT])
+
+
+def _set_response(session: str, message: str) -> None:
+    """Set response message for session."""
+    _run_tmux(["set-option", "-t", session, TERM_CLI_RESPONSE_OPT, message])
+
+
+def _list_sessions() -> list[str]:
+    """Return list of all session names, or empty list if none exist."""
+    res = _run_tmux(["list-sessions", "-F", "#{session_name}"])
+    if not res.ok:
+        # "no server running" when server exists but has no sessions
+        # "error connecting" when socket doesn't exist yet
+        if "no server running" in res.stderr.lower() or "error connecting" in res.stderr.lower():
+            return []
+        raise RuntimeError(res.stderr.strip() or "Failed to list sessions")
+    return [line.strip() for line in res.stdout.splitlines() if line.strip()]
+
+
+def _is_locked(session: str) -> bool:
+    """Check if session is locked (agent read-only mode)."""
+    res = _run_tmux(["show-option", "-t", session, "-qv", TERM_CLI_LOCKED_OPT])
+    return res.ok and res.stdout.strip() != ""
+
+
+def _set_locked(session: str) -> None:
+    """Lock session (agent read-only mode)."""
+    _run_tmux(["set-option", "-t", session, TERM_CLI_LOCKED_OPT, "1"])
+
+
+def _clear_locked(session: str) -> None:
+    """Unlock session."""
+    _run_tmux(["set-option", "-t", session, "-u", TERM_CLI_LOCKED_OPT])
+
+
+def _get_first_session_with_request() -> str | None:
+    """Return the first session that has a pending request, or None."""
+    for session in _list_sessions():
+        if _get_request(session):
+            return session
+    return None
+
+
+def _shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
+def _tmux_cmd_prefix() -> str:
+    """Return the tmux command prefix including socket option if set."""
+    if _tmux_socket:
+        return f"tmux -L {_shlex_quote(_tmux_socket)}"
+    return "tmux"
+
+
+def _get_term_assist_path() -> str:
+    """Get absolute path to term-assist executable."""
+    return os.path.abspath(__file__)
+
+
+# ----------------------------
+# Commands
+# ----------------------------
+
+def cmd_lock(args: argparse.Namespace) -> None:
+    """Lock session (agent read-only mode)."""
+    session = _get_session_or_current(args)
+    _require_session(session)
+    
+    if _is_locked(session):
+        print(f"Session '{session}' is already locked")
+        return
+    
+    _set_locked(session)
+    print(f"Locked session '{session}' (agent read-only)")
+
+
+def cmd_unlock(args: argparse.Namespace) -> None:
+    """Unlock session (allow agent to interact)."""
+    session = _get_session_or_current(args)
+    _require_session(session)
+    
+    if not _is_locked(session):
+        print(f"Session '{session}' is not locked")
+        return
+    
+    _clear_locked(session)
+    print(f"Unlocked session '{session}' (agent can interact)")
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    """List sessions with pending requests (or all sessions with --all)."""
+    sessions = _list_sessions()
+    if not sessions:
+        print("No sessions")
+        return
+    
+    # Find max session name length for formatting (account for [LOCKED] indicator)
+    max_len = max(len(s) + (9 if _is_locked(s) else 0) for s in sessions)
+    
+    has_output = False
+    for session in sessions:
+        request = _get_request(session)
+        locked_indicator = " [LOCKED]" if _is_locked(session) else ""
+        name_with_lock = f"{session}{locked_indicator}"
+        if request:
+            has_output = True
+            print(f"{name_with_lock:<{max_len}}  {request}")
+        elif args.all:
+            has_output = True
+            print(f"{name_with_lock:<{max_len}}  (no request)")
+    
+    if not has_output:
+        print("No pending requests")
+
+
+def _setup_request_ui(session: str, readonly: bool = False) -> None:
+    """Set up the request UI (status bar, keybindings) for a session.
+    
+    This can be called whether the human is already attached or not.
+    The status bar dynamically shows the current request using tmux format conditionals.
+    
+    Args:
+        session: The tmux session name
+        readonly: If True, this is a read-only attach (won't set detached flag on detach)
+    """
+    term_assist = _get_term_assist_path()
+    tmux_cmd = _tmux_cmd_prefix()
+    
+    # Build the term-assist command with socket option if needed
+    term_assist_cmd = _shlex_quote(term_assist)
+    if _tmux_socket:
+        term_assist_cmd = f"{term_assist_cmd} -L {_shlex_quote(_tmux_socket)}"
+    
+    # Check if we've already set up (avoid re-saving original settings)
+    already_setup = _run_tmux(["showenv", "-t", session, "TERM_ASSIST_ORIG_STATUS"]).ok
+    
+    if not already_setup:
+        # Save original status bar settings (only once)
+        _run_tmux(["setenv", "-t", session, "TERM_ASSIST_ORIG_STATUS",
+                   _run_tmux(["show-option", "-gqv", "status"]).stdout.strip()])
+        _run_tmux(["setenv", "-t", session, "TERM_ASSIST_ORIG_STATUS_LEFT",
+                   _run_tmux(["show-option", "-qv", "-t", session, "status-left"]).stdout.strip()])
+        _run_tmux(["setenv", "-t", session, "TERM_ASSIST_ORIG_STATUS_RIGHT",
+                   _run_tmux(["show-option", "-qv", "-t", session, "status-right"]).stdout.strip()])
+        _run_tmux(["setenv", "-t", session, "TERM_ASSIST_ORIG_STATUS_STYLE",
+                   _run_tmux(["show-option", "-qv", "-t", session, "status-style"]).stdout.strip()])
+        
+        # Save original window size and set to manual to preserve agent's terminal dimensions
+        size_result = _run_tmux(["display-message", "-t", session, "-p", "#{window_width}x#{window_height}"])
+        if size_result.ok:
+            _run_tmux(["setenv", "-t", session, "TERM_ASSIST_ORIG_SIZE", size_result.stdout.strip()])
+        _run_tmux(["set-option", "-g", "window-size", "manual"])
+    
+    # Track whether this is a read-only attach (affects detach behavior)
+    if readonly:
+        _run_tmux(["setenv", "-t", session, "TERM_ASSIST_READONLY", "1"])
+    
+    # Set up 2-line status bar with DYNAMIC request info
+    # NOTE: #{@option} format variables don't work in status-format context,
+    # so we use #() shell commands to read the option value instead.
+    # Using printf with %%s (double percent escapes to single % in shell).
+    # 
+    # Status line 0 shows: [LOCKED] [R/O] [session] Request/Ready
+    # - [LOCKED] appears if session is locked (agent read-only mode)
+    # - [R/O] appears if human attached read-only
+    session_q = _shlex_quote(session)
+    status_format_0 = (
+        f'#('
+        # Check for locked status
+        f'LOCKED=$({tmux_cmd} show-option -t {session_q} -qv {TERM_CLI_LOCKED_OPT}); '
+        # Check for read-only attach
+        f'RO=$({tmux_cmd} showenv -t {session_q} TERM_ASSIST_READONLY 2>/dev/null | cut -d= -f2-); '
+        # Build indicators
+        f'INDICATORS=""; '
+        f'if [ -n "$LOCKED" ]; then INDICATORS="[LOCKED] "; fi; '
+        f'if [ -n "$RO" ]; then INDICATORS="$INDICATORS[R/O] "; fi; '
+        # Check for request
+        f'REQ=$({tmux_cmd} show-option -t {session_q} -qv {TERM_CLI_REQUEST_OPT}); '
+        f'if [ -n "$REQ" ]; then '
+        f'printf "%%s" "#[bg=yellow,fg=black] $INDICATORS[{session}] $REQ "; '
+        f'else printf "%%s" "#[bg=green,fg=black] $INDICATORS[{session}] Ready "; fi)'
+    )
+    
+    _run_tmux(["set-option", "-t", session, "status", "2"])
+    _run_tmux(["set-option", "-t", session, "status-format[0]", status_format_0])
+    # Show different help text for readonly mode (can't complete requests, only detach)
+    if readonly:
+        _run_tmux(["set-option", "-t", session, "status-format[1]",
+                   "#[bg=blue,fg=white] Read-only mode  |  Ctrl-B d = Detach "])
+    else:
+        _run_tmux(["set-option", "-t", session, "status-format[1]",
+                   "#[bg=green,fg=black] Ctrl-B Enter = Done  |  Ctrl-B d = Detach "])
+    
+    # Bind Ctrl+B Enter to prompt for response and complete request (stay attached)
+    # Only show prompt if there's an active request, otherwise do nothing
+    # The prompt lets the user enter an optional response message for the agent
+    # We use tmux commands directly (set-option) instead of run-shell to avoid shell
+    # escaping issues with special characters like ! $ ` etc in user input
+    # NOTE: Using double quotes around %% to allow single quotes in user input.
+    # Tradeoff: $VAR and `backticks` will be expanded by tmux's command-prompt.
+    # Using single quotes would preserve those but break on apostrophes.
+    # In command-prompt, %% = user's input.
+    prompt_binding = (
+        f"if-shell '{tmux_cmd} show-option -t {session_q} -qv {TERM_CLI_REQUEST_OPT} | grep -q .' "
+        f"\"command-prompt -p 'Response (Enter to skip):' "
+        f'\\\"set-option -t {session_q} {TERM_CLI_RESPONSE_OPT} \\\\\\"%%\\\\\\" ; '
+        f"set-option -u -t {session_q} {TERM_CLI_REQUEST_OPT} ; "
+        f"set-option -u -t {session_q} {TERM_CLI_DETACHED_OPT}\\\"\""
+    )
+    _run_tmux(["bind-key", "-T", "prefix", "Enter", prompt_binding])
+    
+    # Set hook: on detach, signal detach (if request pending and not readonly) AND restore UI
+    # This runs when human detaches from the session
+    # We do NOT clear the request - we set a detached flag so request-wait can detect it
+    # Read-only observers don't affect request state
+    session_esc = _shlex_quote(session)
+    restore_cmd = f"""
+        if [ -z "$({tmux_cmd} showenv -t {session_esc} TERM_ASSIST_READONLY 2>/dev/null | cut -d= -f2-)" ]; then
+            if [ -n "$({tmux_cmd} show-option -t {session_esc} -qv {TERM_CLI_REQUEST_OPT})" ]; then
+                {tmux_cmd} set-option -t {session_esc} {TERM_CLI_DETACHED_OPT} "1" 2>/dev/null || true;
+            fi;
+        fi;
+        {tmux_cmd} setenv -u -t {session_esc} TERM_ASSIST_READONLY 2>/dev/null || true;
+        {tmux_cmd} set-option -t {session_esc} status "$({tmux_cmd} showenv -t {session_esc} TERM_ASSIST_ORIG_STATUS 2>/dev/null | cut -d= -f2- || echo on)" 2>/dev/null || true;
+        {tmux_cmd} set-option -t {session_esc} status-left "$({tmux_cmd} showenv -t {session_esc} TERM_ASSIST_ORIG_STATUS_LEFT 2>/dev/null | cut -d= -f2-)" 2>/dev/null || true;
+        {tmux_cmd} set-option -t {session_esc} status-right "$({tmux_cmd} showenv -t {session_esc} TERM_ASSIST_ORIG_STATUS_RIGHT 2>/dev/null | cut -d= -f2-)" 2>/dev/null || true;
+        {tmux_cmd} set-option -t {session_esc} -u status-format[0] 2>/dev/null || true;
+        {tmux_cmd} set-option -t {session_esc} -u status-format[1] 2>/dev/null || true;
+        {tmux_cmd} setenv -u -t {session_esc} TERM_ASSIST_ORIG_STATUS 2>/dev/null || true;
+        {tmux_cmd} setenv -u -t {session_esc} TERM_ASSIST_ORIG_STATUS_LEFT 2>/dev/null || true;
+        {tmux_cmd} setenv -u -t {session_esc} TERM_ASSIST_ORIG_STATUS_RIGHT 2>/dev/null || true;
+        {tmux_cmd} setenv -u -t {session_esc} TERM_ASSIST_ORIG_STATUS_STYLE 2>/dev/null || true;
+        {tmux_cmd} setenv -u -t {session_esc} TERM_ASSIST_ORIG_SIZE 2>/dev/null || true;
+        {tmux_cmd} unbind-key -T prefix Enter 2>/dev/null || true;
+        {tmux_cmd} set-hook -u -t {session_esc} client-detached 2>/dev/null || true;
+        {tmux_cmd} set-option -g window-size latest 2>/dev/null || true
+    """
+    _run_tmux(["set-hook", "-t", session, "client-detached", f"run-shell '{restore_cmd}'"])
+
+
+def cmd_done(args: argparse.Namespace) -> None:
+    """Mark request as complete, optionally with a response message."""
+    session = _get_session_or_current(args)
+    _require_session(session)
+    
+    request = _get_request(session)
+    if not request:
+        # Already done, no-op (allows idempotent calls from hooks)
+        return
+    
+    # Get message from -m or positional argument
+    message = args.message or args.message_positional or None
+    if args.message and args.message_positional:
+        raise ValueError("Cannot use both -m and positional message")
+    
+    # Set response message if provided (before clearing request)
+    if message:
+        _set_response(session, message)
+    
+    # Clear the request and any stale detached flag
+    _clear_request(session)
+    _clear_detached(session)
+    
+    # Show completion message briefly
+    _run_tmux(["display-message", "-t", session, "Request completed ✓"])
+    
+    # The status bar is dynamic - it will automatically show empty/waiting state
+    # since it uses tmux format conditionals on @term_cli_request which is now cleared.
+    # When a new request comes in, it will automatically show the new message.
+    #
+    # We do NOT restore the original status bar here - the human may still be
+    # attached and more requests may come in. Restoration happens on detach.
+
+
+def cmd_attach(args: argparse.Namespace) -> None:
+    """Attach to session with request UI, auto-complete on detach."""
+    # Try to get session from args, current tmux session, first with pending request, or first session
+    session = None
+    if hasattr(args, 'session') and args.session:
+        session = args.session
+    else:
+        session = _get_current_session()
+        if not session:
+            # Default to first session with pending request
+            session = _get_first_session_with_request()
+            if session:
+                print(f"Attaching to '{session}' (has pending request)", file=sys.stderr)
+            else:
+                # Fall back to first available session
+                sessions = _list_sessions()
+                if sessions:
+                    session = sessions[0]
+                    print(f"Attaching to '{session}'", file=sys.stderr)
+    
+    if not session:
+        raise ValueError("No sessions available. Use -s SESSION to specify or create one first.")
+    
+    _require_session(session)
+    
+    readonly = args.readonly if hasattr(args, 'readonly') else False
+    
+    # Always set up the request UI - it shows "Ready" when no request,
+    # and dynamically updates when a request comes in
+    _setup_request_ui(session, readonly=readonly)
+    
+    tmux = _tmux_path()
+    tmux_args = [tmux]
+    if _tmux_socket:
+        tmux_args.extend(["-L", _tmux_socket])
+    tmux_args.extend(["attach-session", "-t", session, "-f", "ignore-size"])
+    
+    if args.readonly:
+        tmux_args = [tmux]
+        if _tmux_socket:
+            tmux_args.extend(["-L", _tmux_socket])
+        tmux_args.extend(["attach-session", "-t", session, "-f", "ignore-size,read-only"])
+    
+    os.execvp(tmux, tmux_args)
+
+
+def cmd_detach(args: argparse.Namespace) -> None:
+    """Detach from current session."""
+    if not os.environ.get("TMUX"):
+        raise ValueError("Not in a tmux session")
+    
+    # Send detach key sequence
+    _run_tmux(["detach-client"])
+
+
+def cmd_kill(args: argparse.Namespace) -> None:
+    """Kill a session."""
+    if args.all and args.session:
+        raise ValueError("Cannot use --all with --session")
+    if not args.all and not args.session:
+        raise ValueError("Either --session or --all is required")
+
+    if args.all:
+        sessions = _list_sessions()
+        if not sessions:
+            print("No sessions to kill")
+            return
+        for session in sessions:
+            res = _run_tmux(["kill-session", "-t", session])
+            if not res.ok:
+                raise RuntimeError(res.stderr.strip() or f"Failed to kill session '{session}'")
+            print(f"Killed session '{session}'")
+        return
+
+    session = args.session
+    if not _session_exists(session):
+        raise RuntimeError(f"Session '{session}' does not exist")
+
+    res = _run_tmux(["kill-session", "-t", session])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to kill session")
+    print(f"Killed session '{session}'")
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    """Create a new session (for human to prepare before agent uses it)."""
+    session = args.session
+    if _session_exists(session):
+        raise RuntimeError(f"Session '{session}' already exists")
+    
+    # Validate cwd exists
+    if args.cwd:
+        if not os.path.isdir(args.cwd):
+            raise ValueError(f"--cwd directory does not exist: {args.cwd}")
+    
+    cols = args.cols if args.cols is not None else DEFAULT_COLS
+    rows = args.rows if args.rows is not None else DEFAULT_ROWS
+    
+    tmux_args = ["new-session", "-d", "-s", session, "-x", str(cols), "-y", str(rows)]
+    
+    if args.cwd:
+        tmux_args += ["-c", args.cwd]
+    
+    res = _run_tmux(tmux_args)
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to start session")
+    
+    # Set locked flag if requested
+    if args.locked:
+        _set_locked(session)
+    
+    locked_info = " [LOCKED]" if args.locked else ""
+    print(f"Created session '{session}' ({cols}x{rows}){locked_info}")
+    print(f"Attach with: term-assist attach -s {session}")
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="term-assist",
+        description="""Human companion tool for term-cli session sharing.
+
+Allows humans to collaborate with AI agents on terminal sessions.
+When attached, terminal dimensions are preserved (agent's TUI apps stay stable).
+
+Requires: tmux on PATH
+
+When inside tmux, -s is optional (auto-detected from current session).
+
+Exit codes: 0=success, 1=runtime error, 2=invalid input, 127=tmux not found""",
+        epilog="""Keybindings when attached via 'term-assist attach':
+  Ctrl+B Enter  = Complete request, stay attached
+  Ctrl+B d      = Detach (also completes request)
+
+Examples:
+  term-assist list                      # See pending agent requests
+  term-assist list -a                   # See all sessions
+  term-assist attach                    # Attach to first session (prefers pending requests)
+  term-assist attach -s dev             # Attach to specific session
+  term-assist attach -s dev -r          # Read-only observation
+  term-assist done                      # Mark complete (while attached)
+  term-assist done -m "password: xyz"   # Mark complete with message for agent
+  term-assist start -s prep -c ~/proj   # Create session for agent
+
+Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var'""",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    
+    # Global options (before subcommands)
+    p.add_argument("-L", "--socket-name", metavar="NAME",
+                   help="Use a different tmux socket (for isolated servers)")
+    
+    sub = p.add_subparsers(dest="cmd", required=False, metavar="<command>")
+    
+    # list
+    sp = sub.add_parser("list", help="List sessions with pending requests")
+    sp.add_argument("-a", "--all", action="store_true", help="Show all sessions, not just those with requests")
+    sp.set_defaults(func=cmd_list)
+    
+    # attach
+    sp = sub.add_parser("attach", help="Attach with request UI, auto-complete on detach")
+    sp.add_argument("-s", "--session", metavar="NAME", help="Session name (default: first with request, or first)")
+    sp.add_argument("-r", "--readonly", action="store_true", help="Read-only mode (can't type, but sees request UI)")
+    sp.set_defaults(func=cmd_attach)
+    
+    # done
+    sp = sub.add_parser("done", help="Mark request as complete")
+    sp.add_argument("-s", "--session", metavar="NAME", help="Session name (optional if in tmux)")
+    sp.add_argument("-m", "--message", metavar="MSG", help="Response message for agent")
+    sp.add_argument("message_positional", nargs="?", metavar="MESSAGE", help="Response message (alternative to -m)")
+    sp.set_defaults(func=cmd_done)
+    
+    # detach
+    sp = sub.add_parser("detach", help="Detach from current session")
+    sp.set_defaults(func=cmd_detach)
+    
+    # start
+    sp = sub.add_parser("start", help="Create session for agent to use later")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("-c", "--cwd", metavar="DIR", help="Working directory")
+    sp.add_argument("-x", "--cols", type=int, metavar="N", help=f"Width (default: {DEFAULT_COLS})")
+    sp.add_argument("-y", "--rows", type=int, metavar="N", help=f"Height (default: {DEFAULT_ROWS})")
+    sp.add_argument("-l", "--locked", action="store_true", help="Start locked (agent read-only)")
+    sp.set_defaults(func=cmd_start)
+    
+    # kill
+    sp = sub.add_parser("kill", help="Kill session")
+    sp.add_argument("-s", "--session", metavar="NAME", help="Session name")
+    sp.add_argument("-a", "--all", action="store_true", help="Kill all sessions")
+    sp.set_defaults(func=cmd_kill)
+    
+    # lock
+    sp = sub.add_parser("lock", help="Lock session (agent read-only)")
+    sp.add_argument("-s", "--session", metavar="NAME", help="Session name (optional if in tmux)")
+    sp.set_defaults(func=cmd_lock)
+    
+    # unlock
+    sp = sub.add_parser("unlock", help="Unlock session (agent can interact)")
+    sp.add_argument("-s", "--session", metavar="NAME", help="Session name (optional if in tmux)")
+    sp.set_defaults(func=cmd_unlock)
+    
+    return p
+
+
+# All valid command names for prefix matching
+COMMANDS = ["list", "attach", "done", "detach", "start", "kill", "lock", "unlock"]
+
+
+def _expand_command(cmd: str) -> str:
+    """Expand abbreviated command to full name if unambiguous."""
+    if cmd in COMMANDS:
+        return cmd
+    matches = [c for c in COMMANDS if c.startswith(cmd)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous command '{cmd}': could be {', '.join(sorted(matches))}")
+    return cmd  # Let argparse handle unknown command error
+
+
+def main(argv: list[str] | None = None) -> int:
+    global _tmux_socket
+    
+    parser = build_parser()
+    
+    # Expand abbreviated commands before parsing
+    # Handle global options like -L/--socket-name that come before the command
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = list(argv)  # Make a mutable copy
+    
+    # Find the command (first non-option argument)
+    skip_next = False
+    for i, arg in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg.startswith("-"):
+            # Skip option and its value if it takes one
+            if arg in ("-L", "--socket-name"):
+                skip_next = True
+            continue
+        # Found a command - try to expand it
+        try:
+            argv[i] = _expand_command(arg)
+        except ValueError as e:
+            _eprint(f"Error: {e}")
+            return EXIT_INPUT_ERROR
+        break
+    
+    args = parser.parse_args(argv)
+    
+    # Set global socket name if provided
+    if hasattr(args, 'socket_name') and args.socket_name:
+        _tmux_socket = args.socket_name
+    
+    # Show help if no command given
+    if args.cmd is None:
+        parser.print_help()
+        return EXIT_SUCCESS
+    
+    try:
+        args.func(args)
+        return EXIT_SUCCESS
+    
+    except FileNotFoundError as e:
+        _eprint(f"Error: {e}")
+        return EXIT_NOT_FOUND
+    
+    except ValueError as e:
+        _eprint(f"Error: {e}")
+        return EXIT_INPUT_ERROR
+    
+    except RuntimeError as e:
+        _eprint(f"Error: {e}")
+        return EXIT_RUNTIME_ERROR
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

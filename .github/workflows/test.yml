@@ -1,0 +1,31 @@
+name: Tests
+
+on: [push]
+
+jobs:
+  test:
+
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.9', '3.12']
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install tmux (Ubuntu)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y tmux
+    - name: Install tmux (macOS)
+      if: runner.os == 'macOS'
+      run: brew install tmux
+    - name: Install test dependencies
+      run: pip install -r requirements-test.txt
+    - name: Run tests
+      run: ./run-tests.sh
+      timeout-minutes: 5

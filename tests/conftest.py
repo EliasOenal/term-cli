@@ -57,8 +57,7 @@ def cleanup_session(tmux_socket: str, name: str, term_cli: Callable[..., RunResu
     
     This handles:
     1. Unlocking the session (in case test locked it via term-assist)
-    2. Resetting global window-size to 'latest' (term-assist attach sets it to 'manual',
-       and killing a session with window-size=manual can crash the tmux server)
+    2. Unsetting per-session window-size (term-assist attach sets it to 'manual')
     3. Killing the session
     """
     subprocess.run(
@@ -66,7 +65,7 @@ def cleanup_session(tmux_socket: str, name: str, term_cli: Callable[..., RunResu
         capture_output=True,
     )
     subprocess.run(
-        ["tmux", "-L", tmux_socket, "set-option", "-g", "window-size", "latest"],
+        ["tmux", "-L", tmux_socket, "set-option", "-t", name, "-u", "window-size"],
         capture_output=True,
     )
     term_cli("kill", "-s", name)

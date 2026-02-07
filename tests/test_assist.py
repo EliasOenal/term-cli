@@ -1,9 +1,11 @@
 """
 Tests for term-assist: human companion tool for session sharing.
 
-Note: We can't easily test actual attach behavior since it uses os.execvp(),
-but we can test command parsing, session resolution, and integration with
-term-cli's request system.
+Most attach tests use the "nested tmux" pattern: a helper term-cli session
+runs ``term-assist attach`` (or ``tmux attach``) with ``TMUX=''`` to bypass
+tmux's nesting guard.  This lets us test actual attach behavior—including
+window-size preservation—without a real interactive terminal.  See
+AGENTS.md § "Nested tmux testing pattern" for details.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import RunResult, cleanup_session, unique_session_name
+from conftest import RunResult, cleanup_session, retry_until, unique_session_name
 
 
 # Path to term-assist
@@ -493,3 +495,114 @@ class TestKill:
             assert session in result.stdout
         finally:
             term_cli("kill", "-s", session, "-f")
+
+
+class TestAttachPreservesSize:
+    """Tests that term-assist attach preserves the agent's terminal dimensions.
+
+    Uses the nested-tmux pattern: a helper term-cli session runs
+    ``TMUX='' term-assist attach`` to attach to the target session.  The
+    helper's own terminal size differs from the target, so any resize would
+    be visible.  See AGENTS.md § "Nested tmux testing pattern".
+    """
+
+    def _get_window_size(self, tmux_socket: str, session: str) -> str:
+        """Return 'WxH' for a session's first window."""
+        res = subprocess.run(
+            ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", session,
+             "#{window_width}x#{window_height}"],
+            capture_output=True, text=True,
+        )
+        return res.stdout.strip()
+
+    def _session_has_client(self, tmux_socket: str, session: str) -> bool:
+        """Check whether session has at least one attached client."""
+        res = subprocess.run(
+            ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", session,
+             "#{session_attached}"],
+            capture_output=True, text=True,
+        )
+        return res.stdout.strip() not in ("", "0")
+
+    def test_attach_preserves_agent_dimensions(
+        self, tmux_socket: str, session_factory, term_cli, term_assist,
+    ):
+        """term-assist attach must not resize the agent's session.
+
+        Creates a 120x40 target and a 60x15 helper.  The helper runs
+        ``term-assist attach`` against the target; the target must stay
+        120x40 while the client is connected.
+        """
+        target = session_factory(cols=120, rows=40)
+        helper = unique_session_name()
+        term_cli("start", "-s", helper, "-x", "60", "-y", "15", check=True)
+        term_cli("wait", "-s", helper, "-t", "10", check=True)
+
+        assert self._get_window_size(tmux_socket, target) == "120x40"
+
+        # Run term-assist attach inside the helper (TMUX='' bypasses nesting guard)
+        term_assist_path = str(TERM_ASSIST)
+        term_cli(
+            "run", "-s", helper,
+            f"TMUX='' {sys.executable} {term_assist_path}"
+            f" -L {tmux_socket} attach -s {target}",
+        )
+
+        try:
+            # Wait for the client to register on the target session
+            assert retry_until(
+                lambda: self._session_has_client(tmux_socket, target),
+                timeout=5.0,
+            ), "term-assist attach did not register a client on target"
+
+            # The target must retain its original dimensions
+            assert self._get_window_size(tmux_socket, target) == "120x40", \
+                "term-assist attach resized the agent's session"
+        finally:
+            # Detach the inner tmux client, then kill helper
+            term_cli("send-key", "-s", helper, "C-b")
+            term_cli("send-key", "-s", helper, "d")
+            term_cli("wait", "-s", helper, "-t", "5")
+            term_cli("kill", "-s", helper, "-f")
+
+    def test_multiple_sessions_independent_after_attach(
+        self, tmux_socket: str, session_factory, term_cli, term_assist,
+    ):
+        """Attaching to one session must not affect another session's size.
+
+        Regression test: global ``window-size manual`` caused new sessions
+        to get 10000x10000 on tmux next-3.7 and crashed 3.6a.  Per-session
+        ``window-size manual`` avoids both issues.
+        """
+        target = session_factory(cols=100, rows=30)
+        helper = unique_session_name()
+        term_cli("start", "-s", helper, "-x", "60", "-y", "15", check=True)
+        term_cli("wait", "-s", helper, "-t", "10", check=True)
+
+        # Attach helper to target (sets per-session window-size manual)
+        term_assist_path = str(TERM_ASSIST)
+        term_cli(
+            "run", "-s", helper,
+            f"TMUX='' {sys.executable} {term_assist_path}"
+            f" -L {tmux_socket} attach -s {target}",
+        )
+
+        try:
+            assert retry_until(
+                lambda: self._session_has_client(tmux_socket, target),
+                timeout=5.0,
+            ), "term-assist attach did not register a client on target"
+
+            # Create a NEW session while target has window-size manual.
+            # This must not crash (3.6a) or get wrong size (next-3.7).
+            new_session = session_factory(cols=80, rows=24)
+            assert self._get_window_size(tmux_socket, new_session) == "80x24", \
+                "New session got wrong size while another session has window-size manual"
+
+            # Target must be unaffected
+            assert self._get_window_size(tmux_socket, target) == "100x30"
+        finally:
+            term_cli("send-key", "-s", helper, "C-b")
+            term_cli("send-key", "-s", helper, "d")
+            term_cli("wait", "-s", helper, "-t", "5")
+            term_cli("kill", "-s", helper, "-f")

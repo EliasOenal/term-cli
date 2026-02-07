@@ -306,3 +306,59 @@ term-cli start --session "$S" && term-cli run --session "$S" --wait --timeout 10
 ```
 
 **Parallel tests:** never use hardcoded session names; always clean up in `finally`.
+
+### Nested tmux testing pattern
+
+To test behavior that requires an attached client (e.g. `term-assist attach`,
+verifying `kill` refuses when humans are attached), use the **nested tmux**
+pattern: run `tmux attach` or `term-assist attach` *inside* a helper term-cli
+session.
+
+tmux normally refuses to nest (it checks `$TMUX`).  Override this by prefixing
+the command with `TMUX=''`:
+
+```python
+helper = unique_session_name()
+term_cli("start", "-s", helper, "-x", "60", "-y", "15", check=True)
+term_cli("wait", "-s", helper, "-t", "10", check=True)
+
+# Attach to target FROM INSIDE the helper session
+term_cli(
+    "run", "-s", helper,
+    f"TMUX='' {sys.executable} {term_assist_path}"
+    f" -L {tmux_socket} attach -s {target}",
+)
+```
+
+**Setup rules:**
+1. The helper session needs its own dimensions (e.g. 60x15) — make them
+   **different** from the target so any resize is detectable.
+2. Wait for the helper's shell prompt *before* running the attach command.
+3. After `run`, poll until the target session shows an attached client:
+   ```python
+   from conftest import retry_until
+   assert retry_until(
+       lambda: self._session_has_client(tmux_socket, target),
+       timeout=5.0,
+   )
+   ```
+
+**Cleanup rules (always in `finally`):**
+1. Send the tmux detach sequence to the helper: `C-b` then `d`.
+2. Wait for the helper's shell prompt to return (the inner tmux has exited).
+3. Force-kill the helper session.
+
+```python
+finally:
+    term_cli("send-key", "-s", helper, "C-b")
+    term_cli("send-key", "-s", helper, "d")
+    term_cli("wait", "-s", helper, "-t", "5")
+    term_cli("kill", "-s", helper, "-f")
+```
+
+This ensures the target has zero attached clients before `session_factory`
+teardown tries to kill it.  Skipping this can cause "session has attached
+clients" errors during cleanup.
+
+**Examples:** `test_session.py::TestKill::test_kill_all_atomicity`,
+`test_assist.py::TestAttachPreservesSize`.

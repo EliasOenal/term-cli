@@ -323,11 +323,14 @@ def _setup_request_ui(session: str, readonly: bool = False) -> None:
         _run_tmux(["setenv", "-t", session, "TERM_ASSIST_ORIG_STATUS_STYLE",
                    _run_tmux(["show-option", "-qv", "-t", session, "status-style"]).stdout.strip()])
         
-        # Save original window size and set to manual to preserve agent's terminal dimensions
+        # Save original window size and set to manual to preserve agent's terminal dimensions.
+        # Use per-session (not global -g) to avoid tmux 3.6a crash: global window-size=manual
+        # causes a NULL dereference when creating a second detached session (fixed in next-3.7
+        # by commit 6234d798, but that fix introduced a sizing regression).
         size_result = _run_tmux(["display-message", "-t", session, "-p", "#{window_width}x#{window_height}"])
         if size_result.ok:
             _run_tmux(["setenv", "-t", session, "TERM_ASSIST_ORIG_SIZE", size_result.stdout.strip()])
-        _run_tmux(["set-option", "-g", "window-size", "manual"])
+        _run_tmux(["set-option", "-t", session, "window-size", "manual"])
     
     # Track whether this is a read-only attach (affects detach behavior)
     if readonly:
@@ -411,7 +414,7 @@ def _setup_request_ui(session: str, readonly: bool = False) -> None:
         {tmux_cmd} setenv -u -t {session_esc} TERM_ASSIST_ORIG_SIZE 2>/dev/null || true;
         {tmux_cmd} unbind-key -T prefix Enter 2>/dev/null || true;
         {tmux_cmd} set-hook -u -t {session_esc} client-detached 2>/dev/null || true;
-        {tmux_cmd} set-option -g window-size latest 2>/dev/null || true
+        {tmux_cmd} set-option -u -t {session_esc} window-size 2>/dev/null || true
     """
     _run_tmux(["set-hook", "-t", session, "client-detached", f"run-shell '{restore_cmd}'"])
 

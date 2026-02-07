@@ -465,6 +465,11 @@ def cmd_start(args: argparse.Namespace) -> None:
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to start session")
 
+    # Workaround: some tmux versions ignore -x/-y on new-session -d when
+    # window-size is manual, so enforce size with resize-window after creation.
+    if not args.no_size:
+        _run_tmux(["resize-window", "-t", session, "-x", str(cols), "-y", str(rows)])
+
     # Set locked flag if requested
     if args.locked:
         _set_locked(session)

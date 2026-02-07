@@ -29,3 +29,23 @@ jobs:
     - name: Run tests
       run: ./run-tests.sh
       timeout-minutes: 5
+    - name: Test installer (user-local)
+      run: |
+        ./install.sh --no-skill
+        test -x ~/.local/bin/term-cli
+        test -x ~/.local/bin/term-assist
+        ~/.local/bin/term-cli --help
+        ~/.local/bin/term-assist --help
+        ./install.sh --uninstall --no-skill
+        test ! -f ~/.local/bin/term-cli
+        test ! -f ~/.local/bin/term-assist
+    - name: Test installer (system-wide)
+      run: |
+        ./install.sh --system --no-skill
+        test -x /usr/local/bin/term-cli
+        test -x /usr/local/bin/term-assist
+        /usr/local/bin/term-cli --help
+        /usr/local/bin/term-assist --help
+        ./install.sh --uninstall --system --no-skill
+        test ! -f /usr/local/bin/term-cli
+        test ! -f /usr/local/bin/term-assist

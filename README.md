@@ -85,26 +85,63 @@ Some workflows have no reliable non-interactive mode: serial consoles, boot menu
 Requires Python 3.8+ and tmux.
 
 ```bash
-# Install tmux
+# Install tmux first (if not already installed)
 brew install tmux        # macOS
 apt install tmux         # Debian/Ubuntu
 
-# Download both tools
+# Install term-cli, term-assist, and agent skill files
+curl -fsSL https://raw.githubusercontent.com/EliasOenal/term-cli/main/install.sh | bash
+```
+
+Or from a cloned repo:
+
+```bash
+git clone https://github.com/EliasOenal/term-cli.git && cd term-cli && ./install.sh
+```
+
+<details>
+<summary>Install options</summary>
+
+```bash
+# System-wide install (to /usr/local/bin, requires sudo)
+./install.sh --system
+
+# Custom install directory
+./install.sh --prefix ~/bin
+
+# Skip skill file installation
+./install.sh --no-skill
+
+# Install skills only for specific agents
+./install.sh --skill opencode,claude
+
+# Uninstall
+./install.sh --uninstall
+```
+
+</details>
+
+<details>
+<summary>Manual installation</summary>
+
+```bash
 curl -O https://raw.githubusercontent.com/EliasOenal/term-cli/main/term-cli
 curl -O https://raw.githubusercontent.com/EliasOenal/term-cli/main/term-assist
 chmod +x term-cli term-assist
 ```
 
+</details>
+
 ### Agent Skills
 
-[Agent Skills](https://agentskills.io) are instructions and resources that agents discover and load on demand to work more accurately. term-cli includes a skill in `skills/term-cli/`.
+[Agent Skills](https://agentskills.io) are instructions and resources that agents discover and load on demand to work more accurately. term-cli includes a skill in `skills/term-cli/`. The installer automatically installs it for all known agents.
 
 **Skills vs MCP:** Skills suit coding agents—concise CLI commands keep context lean when balancing automation with large codebases. MCP servers suit specialized loops that benefit from persistent state and rich introspection. term-cli is CLI-native; no MCP server needed.
 
 **No skill? No problem.** Point your agent at `term-cli --help` and let it figure things out. The CLI is self-documenting.
 
 <details>
-<summary>Install the skill for your agent</summary>
+<summary>Manual skill installation</summary>
 
 Install to your home directory so it works across projects.
 
@@ -117,6 +154,9 @@ mkdir -p ~/.gemini/skills && cp -r skills/term-cli ~/.gemini/skills/
 
 # OpenAI Codex CLI
 mkdir -p ~/.agents/skills && cp -r skills/term-cli ~/.agents/skills/
+
+# OpenClaw
+mkdir -p ~/.openclaw/skills && cp -r skills/term-cli ~/.openclaw/skills/
 
 # Claude Code
 mkdir -p ~/.claude/skills && cp -r skills/term-cli ~/.claude/skills/

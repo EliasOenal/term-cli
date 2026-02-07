@@ -41,7 +41,7 @@ Exit codes: 0=success, 1=runtime error, 2=invalid input, 127=tmux not found
 
 Quick reference:
   term-assist list [-a]                # List sessions with requests (-a for all)
-  term-assist attach [-s NAME] [-r]    # Attach with request UI, auto-complete on detach
+  term-assist attach [-s NAME] [-r]    # Attach with request UI (Ctrl+B Enter to complete)
   term-assist done [-s NAME] [-m MSG]  # Mark complete, optional message for agent
   term-assist detach                   # Detach from current session
   term-assist start -s NAME [options]  # Create session for agent to use later
@@ -55,7 +55,7 @@ For 'attach', -s defaults to first session with pending request, or first sessio
 
 Keybindings when attached:
   Ctrl+B Enter  = Complete request, stay attached
-  Ctrl+B d      = Detach (also completes request)
+  Ctrl+B d      = Detach (if request still pending, agent sees exit code 4)
 
 Short flags: -s (session), -r (read-only), -x (cols), -y (rows), -c (cwd), -a (all), -l (locked)
 """
@@ -451,7 +451,7 @@ def cmd_done(args: argparse.Namespace) -> None:
 
 
 def cmd_attach(args: argparse.Namespace) -> None:
-    """Attach to session with request UI, auto-complete on detach."""
+    """Attach to session with request UI (Ctrl+B Enter to complete)."""
     # Try to get session from args, current tmux session, first with pending request, or first session
     session = None
     if hasattr(args, 'session') and args.session:
@@ -585,7 +585,7 @@ When inside tmux, -s is optional (auto-detected from current session).
 Exit codes: 0=success, 1=runtime error, 2=invalid input, 127=tmux not found""",
         epilog="""Keybindings when attached via 'term-assist attach':
   Ctrl+B Enter  = Complete request, stay attached
-  Ctrl+B d      = Detach (also completes request)
+  Ctrl+B d      = Detach (if request still pending, agent sees exit code 4)
 
 Examples:
   term-assist list                      # See pending agent requests
@@ -613,7 +613,7 @@ Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var
     sp.set_defaults(func=cmd_list)
     
     # attach
-    sp = sub.add_parser("attach", help="Attach with request UI, auto-complete on detach")
+    sp = sub.add_parser("attach", help="Attach with request UI (Ctrl+B Enter to complete)")
     sp.add_argument("-s", "--session", metavar="NAME", help="Session name (default: first with request, or first)")
     sp.add_argument("-r", "--readonly", action="store_true", help="Read-only mode (can't type, but sees request UI)")
     sp.set_defaults(func=cmd_attach)

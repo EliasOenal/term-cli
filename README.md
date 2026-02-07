@@ -19,7 +19,7 @@ Hand control to humans for passwords and MFA prompts. Or flip it: human drives w
 - **term-cli**: Agents run interactive programs in detached terminal sessions (tmux-backed)
 - **term-assist**: Humans collaborate, enter passwords, handle MFA, prepare sessions
 
-Single-file Python. No dependencies beyond tmux. 300+ tests, CI on every commit. BSD licensed.
+Single-file Python. No dependencies beyond tmux. 400+ tests, CI on every commit. BSD licensed.
 
 ## The Problem
 
@@ -187,7 +187,7 @@ Works with **Claude Code**, **Gemini CLI**, **Cursor**, **Aider**, **OpenCode**,
 | `send-text --session NAME "text" --enter` | Send text (--enter for Enter key) |
 | `send-key --session NAME C-c` | Send special key |
 | `send-stdin --session NAME < file.txt` | Send multiline content |
-| `capture --session NAME --lines 200` | Capture screen (--lines for scrollback) |
+| `capture --session NAME` | Capture screen (--tail/--scrollback for more) |
 | `wait --session NAME --timeout 30` | Wait for prompt |
 | `wait-idle --session NAME --seconds 2` | Wait for output to settle |
 | `wait-for --session NAME "pattern"` | Wait for text to appear |
@@ -227,15 +227,15 @@ Run `term-cli --help` or `term-cli <command> --help` for details.
 | Key | Action |
 |-----|--------|
 | `Ctrl+B Enter` | Complete request (prompt for optional message to agent) |
-| `Ctrl+B d` | Detach without completing (agent's request-wait fails) |
+| `Ctrl+B d` | Detach (if request still pending, agent's request-wait fails) |
 
 ## Example: Dev Server
 
 ```bash
 term-cli start --session server && term-cli run --session server "npm run dev"
-term-cli wait-idle --session server --seconds 3 --timeout 30 && term-cli capture -s server
+term-cli wait-idle --session server --timeout 15 && term-cli capture --session server
 # ... later ...
-term-cli send-key --session server C-c && term-cli wait -s server
+term-cli send-key --session server C-c && term-cli wait --session server
 term-cli kill --session server
 ```
 
@@ -252,10 +252,10 @@ term-cli send-text -s debug "c" --enter && term-cli wait -s debug && term-cli ca
 **Agent side:**
 ```bash
 term-cli start --session remote && term-cli run --session remote "ssh user@server"
-term-cli wait --session remote --timeout 30 && term-cli capture -s remote
+term-cli wait --session remote && term-cli capture --session remote
 # If password prompt shown, request human help; if shell prompt, key auth succeeded
 term-cli request --session remote --message "Please enter SSH password"
-term-cli request-wait --session remote && term-cli capture -s remote
+term-cli request-wait --session remote && term-cli capture --session remote
 term-cli run --session remote "ls -la" --wait
 ```
 
@@ -292,7 +292,7 @@ term-cli kill --session prod
 - **Human collaboration**: `request`/`request-wait` + term-assist for passwords, MFA prompts, manual steps
 - **Locked sessions**: Human controls, agent observes (start with `--locked` or use `term-assist lock`)
 - **Dimension preservation**: Human joining doesn't resize agent's terminal
-- **Clean output**: Visible screen only, whitespace trimmed, `--lines N` for scrollback
+- **Clean output**: Visible screen only, whitespace trimmed, `--scrollback N` for history
 - **Self-documenting**: `--help` on every command
 
 ## Exit Codes
@@ -303,7 +303,7 @@ term-cli kill --session prod
 | 1 | Runtime error |
 | 2 | Invalid input |
 | 3 | Timeout |
-| 4 | Human detached without completing |
+| 4 | Human detached while request pending |
 | 5 | Session locked (agent read-only) |
 | 127 | tmux not found |
 

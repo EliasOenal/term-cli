@@ -124,10 +124,11 @@ class TestScroll:
         assert "Scrolled up 5 lines" in result.stdout
 
     def test_scroll_zero(self, session, term_cli):
-        """scroll with zero does nothing."""
+        """scroll with zero fails with validation error."""
         result = term_cli("scroll", "-s", session, "0")
-        assert result.ok
-        assert "0 lines" in result.stdout
+        assert not result.ok
+        assert result.returncode == 2
+        assert "non-zero" in result.stderr.lower()
 
     def test_scroll_large_number(self, session, term_cli):
         """scroll with large number works (even if not that much content)."""

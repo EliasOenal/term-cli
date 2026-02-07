@@ -20,8 +20,7 @@ class TestRequest:
         """Request command sets a pending request."""
         result = term_cli("request", "-s", session, "-m", "Please help")
         assert result.ok
-        # No stdout output by design
-        assert result.stdout == ""
+        assert "request stored" in result.stdout.lower()
         
         # Verify request is pending
         status = term_cli("request-status", "-s", session)
@@ -31,6 +30,7 @@ class TestRequest:
         """Request command without -m uses default message."""
         result = term_cli("request", "-s", session)
         assert result.ok  # Default message is used
+        assert "request stored" in result.stdout.lower()
         
         # Verify request is pending
         status = term_cli("request-status", "-s", session)
@@ -56,10 +56,12 @@ class TestRequestStatus:
         assert result.returncode == 0  # 0 = pending
 
     def test_request_status_no_request(self, session, term_cli):
-        """Request-status returns 1 when no request is pending."""
+        """Request-status returns 1 when no request is pending, without stderr."""
         # Don't make any request - just check status
         result = term_cli("request-status", "-s", session)
         assert result.returncode == 1  # 1 = no pending request
+        assert "none" in result.stdout.lower()
+        assert result.stderr == ""  # No error output for a normal query
 
     def test_request_status_nonexistent_session(self, term_cli):
         """Request-status on nonexistent session fails."""
@@ -167,7 +169,7 @@ class TestRequestWorkflow:
         # Make request
         req = term_cli("request", "-s", session, "-m", "Enter password")
         assert req.ok
-        assert req.stdout == ""  # No output by design
+        assert "request stored" in req.stdout.lower()
         
         # Now pending
         status = term_cli("request-status", "-s", session)

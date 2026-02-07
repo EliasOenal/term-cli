@@ -270,7 +270,7 @@ class TestStart:
             
             # Verify cwd
             term_cli("run", "-s", session, "pwd", "-w")
-            capture = term_cli("capture", "-s", session)
+            capture = term_cli("capture", "-s", session, "-n", "50")
             assert str(tmp_path) in capture.stdout
         finally:
             term_cli("kill", "-s", session, "-f")

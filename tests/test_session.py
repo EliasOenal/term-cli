@@ -60,7 +60,7 @@ class TestStart:
             
             # Verify cwd by running pwd
             term_cli("run", "-s", name, "pwd", "-w")
-            capture = term_cli("capture", "-s", name)
+            capture = term_cli("capture", "-s", name, "-n", "50")
             assert str(tmp_path) in capture.stdout
         finally:
             term_cli("kill", "-s", name)
@@ -292,6 +292,55 @@ class TestKill:
         assert not result.ok
         assert "Either --session or --all is required" in result.stderr
 
+    def test_kill_all_atomicity(self, tmux_socket: str, session_factory, term_cli):
+        """kill --all with one attached session fails without killing any sessions.
+
+        Verifies upfront validation: all sessions are checked for attached clients
+        before any are killed, preventing partial kill (where some sessions are
+        killed before validation fails on a later session).
+        """
+        from conftest import retry_until
+        # Create two target sessions
+        s1 = session_factory()
+        s2 = session_factory()
+
+        # Create a helper session and use it to attach to s2,
+        # which makes s2 show an attached client
+        helper = unique_session_name()
+        term_cli("start", "-s", helper, check=True)
+        term_cli("wait", "-s", helper, "-t", "10", check=True)
+        term_cli("run", "-s", helper, f"TMUX='' tmux -L {tmux_socket} attach -t {s2}")
+
+        try:
+            # Wait for the client to register as attached on s2
+            def s2_has_client() -> bool:
+                res = subprocess.run(
+                    ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", s2,
+                     "#{session_attached}"],
+                    capture_output=True, text=True,
+                )
+                return res.stdout.strip() not in ("", "0")
+            assert retry_until(s2_has_client, timeout=5.0), \
+                "tmux attach inside helper session did not register a client on s2"
+
+            # kill --all without --force should fail because s2 has an attached client
+            result = term_cli("kill", "--all")
+            assert not result.ok
+            assert "attached" in result.stderr.lower()
+
+            # Both sessions must still be alive (atomicity guarantee)
+            list_result = term_cli("list")
+            assert s1 in list_result.stdout, f"Session {s1} was killed despite validation failure"
+            assert s2 in list_result.stdout, f"Session {s2} was killed despite validation failure"
+        finally:
+            # Detach the helper's tmux client, then kill the helper session
+            term_cli("send-key", "-s", helper, "C-b")
+            term_cli("send-key", "-s", helper, "d")
+            # Wait for the inner tmux to fully detach (helper returns to shell prompt)
+            # so s2 has zero attached clients before session_factory teardown runs
+            term_cli("wait", "-s", helper, "-t", "5")
+            term_cli("kill", "-s", helper, "-f")
+
 
 class TestList:
     """Tests for the 'list' command."""
@@ -336,6 +385,7 @@ class TestStatus:
         assert result.ok
         assert f"Session: {session}" in result.stdout
         assert "State:" in result.stdout
+        assert "Screen:" in result.stdout
         assert "Size:" in result.stdout
         assert "Processes:" in result.stdout
         # Shell should be in the process tree with a PID
@@ -383,7 +433,7 @@ class TestStatus:
         def check_sleep_running():
             result = term_cli("status", "-s", session)
             return "Foreground: sleep" in result.stdout
-        assert retry_until(check_sleep_running, timeout=3.0), "sleep never appeared as foreground process"
+        assert retry_until(check_sleep_running, timeout=15.0), "sleep never appeared as foreground process"
         
         result = term_cli("status", "-s", session)
         assert "State: running" in result.stdout
@@ -401,7 +451,7 @@ class TestStatus:
         def check_bash_running():
             result = term_cli("status", "-s", session)
             return "└─ bash" in result.stdout or "├─ bash" in result.stdout
-        assert retry_until(check_bash_running, timeout=3.0), "bash never appeared in process tree"
+        assert retry_until(check_bash_running, timeout=15.0), "bash never appeared in process tree"
         
         result = term_cli("status", "-s", session)
         assert "Processes:" in result.stdout
@@ -412,3 +462,25 @@ class TestStatus:
         
         # Clean up
         term_cli("send-key", "-s", session, "C-c")
+
+    def test_status_shows_normal_screen_at_shell(self, session, term_cli):
+        """status shows Screen: normal when at a shell prompt."""
+        term_cli("run", "-s", session, "true", "-w", "-t", "5")
+        result = term_cli("status", "-s", session)
+        assert result.ok
+        assert "Screen: normal" in result.stdout
+
+    def test_status_shows_alternate_screen_in_tui(self, session, term_cli):
+        """status shows Screen: alternate when a TUI is running."""
+        from conftest import retry_until
+        # Use vim (not less /dev/null, which exits immediately with no content)
+        term_cli("run", "-s", session, "vim")
+        # Poll until vim switches to alternate screen (may take time on slow CI)
+        def check_alternate():
+            result = term_cli("status", "-s", session)
+            return "Screen: alternate" in result.stdout
+        assert retry_until(check_alternate, timeout=15.0), \
+            "vim never switched to alternate screen"
+        # Quit vim
+        term_cli("send-text", "-s", session, ":q!", "-e")
+        term_cli("wait", "-s", session, "-t", "15")

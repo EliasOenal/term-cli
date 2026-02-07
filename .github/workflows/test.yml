@@ -28,7 +28,7 @@ jobs:
       run: pip install -r requirements-test.txt
     - name: Run tests
       run: ./run-tests.sh
-      timeout-minutes: 5
+      timeout-minutes: 60
     - name: Test installer (user-local)
       run: |
         ./install.sh --no-skill

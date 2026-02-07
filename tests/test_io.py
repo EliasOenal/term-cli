@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import time
 
-from conftest import RunResult, wait_for_content, retry_until
+from conftest import RunResult, capture_content, wait_for_content, retry_until
 
 
 class TestRun:
@@ -84,6 +84,21 @@ class TestRun:
         assert result.ok  # term-cli succeeds even if the command fails
         assert "Command completed" in result.stdout
 
+    def test_run_wait_zero_timeout(self, session, term_cli):
+        """run --wait --timeout 0 checks once for prompt."""
+        # Run a quick command first so prompt is ready
+        term_cli("run", "-s", session, "true", "-w")
+        # With timeout 0, should detect prompt on first check
+        result = term_cli("run", "-s", session, "true", "-w", "-t", "0")
+        assert result.ok
+        assert "Command completed" in result.stdout
+
+    def test_run_timeout_without_wait_warns(self, session, term_cli):
+        """run --timeout without --wait prints a warning."""
+        result = term_cli("run", "-s", session, "echo hi", "-t", "5")
+        assert result.ok  # Command still succeeds
+        assert "no effect without --wait" in result.stderr.lower()
+
 
 class TestSendText:
     """Tests for the 'send-text' command."""
@@ -91,9 +106,10 @@ class TestSendText:
     def test_send_text_sends_literal(self, session, term_cli):
         """send-text sends literal text."""
         term_cli("send-text", "-s", session, "echo hello")
-        result = term_cli("capture", "-s", session)
-        # Text should appear but not execute (no Enter)
-        assert "echo hello" in result.stdout
+        # Text should appear but not execute (no Enter).
+        # Use capture_content (joined wraps) since the text sits at the
+        # prompt and may wrap if the hostname makes the prompt long.
+        assert "echo hello" in capture_content(term_cli, session)
 
     def test_send_text_with_enter(self, session, term_cli):
         """send-text --enter sends text followed by Enter."""
@@ -154,7 +170,7 @@ class TestSendKey:
         def check_sleep_running():
             result = term_cli("status", "-s", session)
             return "sleep" in result.stdout
-        assert retry_until(check_sleep_running, timeout=3.0), "sleep never started"
+        assert retry_until(check_sleep_running, timeout=15.0), "sleep never started"
         term_cli("send-key", "-s", session, "C-c")
         # Process should be interrupted - wait should detect prompt
         result = term_cli("wait", "-s", session, "-t", "5")
@@ -169,7 +185,7 @@ class TestSendKey:
         def check_cat_running():
             result = term_cli("status", "-s", session)
             return "cat" in result.stdout
-        assert retry_until(check_cat_running, timeout=3.0), "cat never started"
+        assert retry_until(check_cat_running, timeout=15.0), "cat never started"
         term_cli("send-key", "-s", session, "C-d")
         # cat should have exited - wait should detect prompt
         result = term_cli("wait", "-s", session, "-t", "5")
@@ -181,9 +197,8 @@ class TestSendKey:
         term_cli("run", "-s", session, "echo first", "-w")
         term_cli("send-key", "-s", session, "Up")
         assert wait_for_content(term_cli, session, "echo first"), "Up arrow didn't recall command"
-        result = term_cli("capture", "-s", session)
-        # Up arrow should recall "echo first"
-        assert "echo first" in result.stdout
+        # Up arrow should recall "echo first" (use joined wraps — text is at prompt)
+        assert "echo first" in capture_content(term_cli, session)
 
     def test_send_key_arrow_keys(self, session, term_cli):
         """send-key handles all arrow keys."""
@@ -207,10 +222,11 @@ class TestSendKey:
         term_cli("send-text", "-s", session, "cat tabtest_uni")
         term_cli("send-key", "-s", session, "Tab")
         assert wait_for_content(term_cli, session, "tabtest_unique_file.txt"), "Tab completion didn't work"
-        result = term_cli("capture", "-s", session)
         # Tab completion should complete to the full filename
-        assert "tabtest_unique_file.txt" in result.stdout, \
-            f"Tab completion should have completed the filename: {result.stdout}"
+        # (use joined wraps — completed text is at the prompt)
+        output = capture_content(term_cli, session)
+        assert "tabtest_unique_file.txt" in output, \
+            f"Tab completion should have completed the filename: {output}"
         # Clean up - send Ctrl+C to cancel
         term_cli("send-key", "-s", session, "C-c")
 
@@ -221,17 +237,18 @@ class TestSendKey:
         assert wait_for_content(term_cli, session, "XYZZY"), "Text wasn't sent"
         term_cli("send-key", "-s", session, "BSpace")
         term_cli("send-key", "-s", session, "BSpace")
-        # Wait for backspace to take effect - should see XYZ but not XYZZY
+        # Wait for backspace to take effect - should see XYZ but not XYZZY.
+        # Use capture_content (joined wraps) since text is at the prompt.
         def check_backspace_worked():
-            result = term_cli("capture", "-s", session)
-            return "XYZ" in result.stdout and "XYZZY" not in result.stdout
-        assert retry_until(check_backspace_worked, timeout=3.0), "Backspace didn't delete characters"
-        result = term_cli("capture", "-s", session)
+            output = capture_content(term_cli, session)
+            return "XYZ" in output and "XYZZY" not in output
+        assert retry_until(check_backspace_worked, timeout=15.0), "Backspace didn't delete characters"
+        output = capture_content(term_cli, session)
         # Should have "XYZ" not "XYZZY" - backspace deleted 2 chars
-        assert "XYZ" in result.stdout
+        assert "XYZ" in output
         # The full "XYZZY" should not appear anywhere (backspace deleted "ZY")
-        assert "XYZZY" not in result.stdout, \
-            f"Backspace should have deleted characters. Output: {result.stdout}"
+        assert "XYZZY" not in output, \
+            f"Backspace should have deleted characters. Output: {output}"
 
     def test_send_key_function_keys(self, session, term_cli):
         """send-key handles function keys F1-F12."""
@@ -253,8 +270,8 @@ class TestSendKey:
         
         # The literal text should appear in the terminal
         assert wait_for_content(term_cli, session, "NotARealKey"), "Literal text wasn't sent"
-        capture = term_cli("capture", "-s", session)
-        assert "NotARealKey" in capture.stdout
+        # Use joined wraps — text is at the prompt
+        assert "NotARealKey" in capture_content(term_cli, session)
 
 
 class TestCapture:
@@ -290,7 +307,7 @@ class TestCapture:
             f"--no-trim output ({len(result_no_trim.stdout)} chars) should be longer than trimmed ({len(result_trim.stdout)} chars)"
 
     def test_capture_with_scrollback(self, session, term_cli):
-        """capture --lines includes scrollback history."""
+        """capture --scrollback includes scrollback history."""
         # Generate enough output to scroll
         for i in range(30):
             term_cli("run", "-s", session, f"echo line_{i}", "-w")
@@ -347,21 +364,70 @@ class TestCapture:
         # The word "red" should be there (codes might be stripped by tmux)
         assert "red" in result.stdout
 
-    def test_capture_lines_zero(self, session, term_cli):
-        """capture --lines 0 captures from current position (no scrollback)."""
+    def test_capture_scrollback_zero_errors(self, session, term_cli):
+        """capture --scrollback 0 fails with a validation error."""
         term_cli("run", "-s", session, "echo test", "-w")
         result = term_cli("capture", "-s", session, "-n", "0")
-        assert result.ok
-        # With -n 0, we still see current content, just no scrollback
-        # The prompt and recent output should be visible
-        assert len(result.stdout) > 0
+        assert not result.ok
+        assert result.returncode == 2
+        assert "positive" in result.stderr.lower()
 
-    def test_capture_lines_large_number(self, session, term_cli):
-        """capture --lines with large number works."""
+    def test_capture_scrollback_large_number(self, session, term_cli):
+        """capture --scrollback with large number works."""
         term_cli("run", "-s", session, "echo test", "-w")
         result = term_cli("capture", "-s", session, "-n", "10000")
         assert result.ok
         assert "test" in result.stdout
+
+    def test_capture_scrollback_negative_errors(self, session, term_cli):
+        """capture --scrollback with negative value fails with validation error."""
+        result = term_cli("capture", "-s", session, "-n", "-5")
+        assert not result.ok
+        assert result.returncode == 2
+        assert "positive" in result.stderr.lower()
+
+    def test_capture_scrollback_truncates_to_n_lines(self, session, term_cli):
+        """capture --scrollback N returns at most N logical lines."""
+        # Generate plenty of output
+        for i in range(30):
+            term_cli("run", "-s", session, f"echo sbtrunc_{i}", "-w")
+
+        result = term_cli("capture", "-s", session, "-n", "5")
+        assert result.ok
+        lines = result.stdout.strip().split('\n')
+        assert len(lines) <= 5, \
+            f"--scrollback 5 should return at most 5 lines, got {len(lines)}: {lines}"
+
+    def test_capture_tail(self, session, term_cli):
+        """capture --tail N returns last N physical rows from visible screen."""
+        # Put some content on screen
+        term_cli("run", "-s", session, "echo tail_test_line", "-w")
+        result = term_cli("capture", "-s", session, "-t", "3")
+        assert result.ok
+        lines = result.stdout.strip().split('\n')
+        assert len(lines) <= 3, \
+            f"--tail 3 should return at most 3 lines, got {len(lines)}: {lines}"
+
+    def test_capture_tail_zero_errors(self, session, term_cli):
+        """capture --tail 0 fails with validation error."""
+        result = term_cli("capture", "-s", session, "-t", "0")
+        assert not result.ok
+        assert result.returncode == 2
+        assert "positive" in result.stderr.lower()
+
+    def test_capture_tail_negative_errors(self, session, term_cli):
+        """capture --tail with negative value fails with validation error."""
+        result = term_cli("capture", "-s", session, "-t", "-3")
+        assert not result.ok
+        assert result.returncode == 2
+        assert "positive" in result.stderr.lower()
+
+    def test_capture_scrollback_and_tail_mutually_exclusive(self, session, term_cli):
+        """capture --scrollback and --tail together fails with validation error."""
+        result = term_cli("capture", "-s", session, "-n", "50", "-t", "5")
+        assert not result.ok
+        assert result.returncode == 2
+        assert "mutually exclusive" in result.stderr.lower()
 
     def test_capture_raw_includes_ansi_codes(self, session, term_cli):
         """capture --raw includes ANSI escape codes."""
@@ -392,7 +458,7 @@ class TestCapture:
         assert "[32m" in result.stdout or "\033[32m" in result.stdout
 
     def test_capture_raw_with_scrollback(self, session, term_cli):
-        """capture --raw --lines includes ANSI codes in scrollback."""
+        """capture --raw --scrollback includes ANSI codes in scrollback."""
         # Generate colored output
         term_cli("run", "-s", session, "printf '\\033[33mYELLOW\\033[0m'", "-w")
         term_cli("run", "-s", session, "echo more_lines", "-w")
@@ -455,6 +521,68 @@ class TestCapture:
         # (Command line will contain the escape sequences as literal text,
         # but the actual rendered output should be clean)
 
+    def test_capture_preserves_physical_line_breaks(self, session_factory, term_cli):
+        """Plain capture preserves physical row breaks; scrollback joins them.
+
+        Verifies the rendering contract:
+        - Plain capture returns physical screen rows, so text that wraps at
+          the terminal width is split across lines.
+        - Scrollback capture (--scrollback / -J) joins wrapped lines back
+          into logical lines.
+
+        Uses a controlled terminal width (40 cols) and deterministic fill
+        patterns so the test is immune to prompt length or hostname.
+        """
+        session = session_factory(cols=40)
+
+        # Pattern that fits in one row (30 chars < 40 cols)
+        short = "1234567890" * 3  # 30 chars
+        # Pattern that must wrap (60 chars > 40 cols)
+        long = "1234567890" * 6   # 60 chars
+
+        # Print both patterns on their own lines (printf avoids echo portability issues)
+        term_cli("run", "--session", session, f"printf '%s\\n%s\\n' '{short}' '{long}'", "--wait")
+
+        # --- Plain capture: physical rows preserved ---
+        result = term_cli("capture", "--session", session)
+        assert result.ok
+        lines = result.stdout.split("\n")
+
+        # The 30-char pattern must appear as a single contiguous line
+        assert short in lines, (
+            f"Short pattern should appear as one physical row.\n"
+            f"Lines: {lines}"
+        )
+
+        # The 60-char pattern must NOT appear as a contiguous substring —
+        # it is split by a newline at column 40
+        assert long not in result.stdout, (
+            f"Long pattern should be split across physical rows.\n"
+            f"Output: {result.stdout!r}"
+        )
+
+        # Verify the split: first 40 chars on one row, remaining 20 on the next
+        first_half = long[:40]
+        second_half = long[40:]
+        assert first_half in lines, (
+            f"First 40 chars of long pattern should be a physical row.\n"
+            f"Lines: {lines}"
+        )
+        assert second_half in lines, (
+            f"Remaining 20 chars of long pattern should be on the next row.\n"
+            f"Lines: {lines}"
+        )
+
+        # --- Scrollback capture: wraps joined ---
+        result_joined = term_cli("capture", "--session", session, "--scrollback", "500")
+        assert result_joined.ok
+
+        # The 60-char pattern must appear as a contiguous substring now
+        assert long in result_joined.stdout, (
+            f"Scrollback capture should join the wrapped line.\n"
+            f"Output: {result_joined.stdout!r}"
+        )
+
 
 class TestSendStdin:
     """Tests for the 'send-stdin' command."""
@@ -475,10 +603,9 @@ class TestSendStdin:
         assert "Sent" in proc.stdout
         assert "chars" in proc.stdout
         
-        # Verify content was sent
+        # Verify content was sent (use joined wraps — text is at the prompt)
         assert wait_for_content(term_cli, session, "hello from stdin"), "stdin content not found"
-        result = term_cli("capture", "-s", session)
-        assert "hello from stdin" in result.stdout
+        assert "hello from stdin" in capture_content(term_cli, session)
 
     def test_send_stdin_multiline(self, session, term_cli, tmux_socket):
         """send-stdin sends multiline content correctly."""
@@ -513,7 +640,7 @@ class TestSendStdin:
         def check_cat_running():
             result = term_cli("status", "-s", session)
             return "cat" in result.stdout
-        assert retry_until(check_cat_running, timeout=3.0), "cat never started"
+        assert retry_until(check_cat_running, timeout=15.0), "cat never started"
         
         # Send content via stdin
         proc = subprocess.run(

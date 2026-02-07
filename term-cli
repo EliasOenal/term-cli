@@ -42,13 +42,13 @@ Env vars: TERM_CLI_COLS, TERM_CLI_ROWS override default size
 
 Exit codes: 0=success, 1=runtime error, 2=invalid input, 3=timeout, 4=detached, 5=locked, 127=tmux not found
 
-tmux keys: C-c C-d C-u (ctrl), Enter Escape Space Tab BSpace, Up Down Left Right,
+tmux keys: C-c C-d C-u C-z (ctrl), Enter Escape Space Tab BSpace, Up Down Left Right,
            Home End NPage PPage, F1-F12
 
 Quick reference:
   term-cli start --session NAME [--cols 80] [--rows 24] [--cwd DIR] [--locked]
   term-cli run --session NAME "cmd" [--wait] [--timeout 10]
-  term-cli capture --session NAME [--lines N]
+  term-cli capture --session NAME [--scrollback N] [--tail N]
   term-cli send-key --session NAME KEY
   term-cli send-text --session NAME "text" [--enter]
   term-cli send-stdin --session NAME < file.txt
@@ -63,7 +63,7 @@ Quick reference:
   term-cli list
 
 Locked sessions (human controls, agent observes):
-  When a session is locked, the agent can only use: capture, status, wait-*, request*, list
+  When a session is locked, the agent can only use: capture, status, wait-*, request*, list, scroll, pipe-log, unpipe
   Locked commands (run, send-*, kill, resize) return exit code 5.
 
 Human assistance (request/response):
@@ -74,8 +74,8 @@ Human assistance (request/response):
 
 Note: wait-for searches the entire visible screen, including the command echo line.
 
-Short flags: -s (session), -w (wait), -t (timeout), -x (cols), -y (rows),
-             -c (cwd), -n (lines), -e (enter/env), -r (raw), -i (idle seconds),
+Short flags: -s (session), -w (wait), -t (timeout/tail), -x (cols), -y (rows),
+             -c (cwd), -n (scrollback), -e (enter/env), -r (raw), -i (idle seconds/ignore-case),
              -m (message), -f (force), -l (locked)
 """
 
@@ -83,7 +83,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -147,6 +146,13 @@ class AgentLocked(Exception):
     """Raised when agent tries to interact with a locked session."""
     pass
 
+
+class QueryResult(Exception):
+    """Non-error result requiring a specific exit code (e.g., query returned 'not found')."""
+    def __init__(self, message: str, exit_code: int = EXIT_RUNTIME_ERROR) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
 # ----------------------------
 # Utilities
 # ----------------------------
@@ -186,7 +192,7 @@ def _session_exists(session: str) -> bool:
 
 def _require_session(session: str) -> None:
     if not _session_exists(session):
-        raise ValueError(f"Session '{session}' does not exist. Create it with: term-cli start -s {session}")
+        raise ValueError(f"Session '{session}' does not exist. Create it with: term-cli start --session {session}")
 
 def _env_int(name: str) -> int | None:
     v = os.environ.get(name)
@@ -226,15 +232,16 @@ def _get_pane_dimensions(session: str) -> tuple[int, int]:
         return (DEFAULT_COLS, DEFAULT_ROWS)
 
 def _capture_screen(session: str, trim: bool = True, raw: bool = False, 
-                    join_wrapped: bool = True) -> str:
+                    join_wrapped: bool = False) -> str:
     """Capture only the visible screen content (not scrollback).
     
     Args:
         session: tmux session name
         trim: Remove trailing whitespace and blank lines
         raw: Include ANSI escape sequences
-        join_wrapped: Join wrapped lines (-J flag). Set False when line numbers
-                      must match cursor position (e.g., prompt detection).
+        join_wrapped: Join wrapped lines (-J flag). Default False to preserve
+                      physical screen layout. Set True for logical line capture
+                      (e.g., scrollback).
     """
     # -p prints to stdout, -J joins wrapped lines, -e includes escape sequences (colors)
     tmux_args = ["capture-pane", "-p", "-t", session]
@@ -357,10 +364,10 @@ def _wait_for_prompt(session: str, timeout: float) -> tuple[bool, float]:
     poll_interval = POLL_INTERVAL_INITIAL
     
     while True:
-        if time.time() - start >= timeout:
-            return (False, time.time() - start)
         if _is_at_prompt(session):
             return (True, time.time() - start)
+        if time.time() - start >= timeout:
+            return (False, time.time() - start)
         time.sleep(poll_interval)
         # Increase poll interval gradually to reduce overhead
         if poll_interval < POLL_INTERVAL_MAX:
@@ -374,10 +381,6 @@ def _wait_for_idle(session: str, idle_seconds: float, timeout: float) -> tuple[b
     poll_interval = POLL_INTERVAL_INITIAL
     
     while True:
-        elapsed = time.time() - start
-        if elapsed >= timeout:
-            return (False, elapsed)
-        
         current_content = _capture_screen(session, trim=False)
         if current_content != last_content:
             last_content = current_content
@@ -387,7 +390,11 @@ def _wait_for_idle(session: str, idle_seconds: float, timeout: float) -> tuple[b
         
         idle_time = time.time() - last_change
         if idle_time >= idle_seconds:
-            return (True, elapsed)
+            return (True, time.time() - start)
+        
+        elapsed = time.time() - start
+        if elapsed >= timeout:
+            return (False, elapsed)
         
         time.sleep(poll_interval)
         # Increase poll interval gradually to reduce CPU usage during long waits
@@ -491,16 +498,17 @@ def cmd_kill(args: argparse.Namespace) -> None:
             return
         for session in sessions:
             _require_unlocked(session)
-        # All sessions unlocked, proceed with kill
-        for session in sessions:
-            # Check for attached humans (unless force)
-            if not args.force:
+        # Validate all unattached (unless force)
+        if not args.force:
+            for session in sessions:
                 attached = _get_session_attached_count(session)
                 if attached > 0:
                     raise RuntimeError(
                         f"Session '{session}' has {attached} attached client(s). "
                         f"Use --force to kill anyway."
                     )
+        # All validated, proceed with kill
+        for session in sessions:
             res = _run_tmux(["kill-session", "-t", session])
             if not res.ok:
                 raise RuntimeError(res.stderr.strip() or f"Failed to kill session '{session}'")
@@ -612,12 +620,15 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.wait:
         # Brief delay to let command start executing
         time.sleep(0.1)
-        timeout = args.timeout if args.timeout else DEFAULT_WAIT_TIMEOUT
+        timeout = args.timeout if args.timeout is not None else DEFAULT_WAIT_TIMEOUT
         success, elapsed = _wait_for_prompt(session, timeout)
         if success:
             print(f"Command completed ({elapsed:.1f}s)")
         else:
             raise OperationTimeout(f"command not completed after {timeout}s (may still be running)")
+    else:
+        if args.timeout is not None:
+            _eprint("Warning: --timeout has no effect without --wait")
 
 def cmd_capture(args: argparse.Namespace) -> None:
     """Capture and print the terminal screen content."""
@@ -626,22 +637,44 @@ def cmd_capture(args: argparse.Namespace) -> None:
 
     trim = not args.no_trim
     raw = args.raw
+    scrollback: int | None = args.scrollback
+    tail: int | None = args.tail
 
-    if args.lines is not None:
-        if args.lines < 0:
-            raise ValueError(f"--lines must be non-negative, got: {args.lines}")
-        # Capture scrollback history
-        tmux_args = ["capture-pane", "-p", "-J", "-t", session, "-S", f"-{args.lines}"]
+    if scrollback is not None and tail is not None:
+        raise ValueError("--scrollback and --tail are mutually exclusive")
+
+    if scrollback is not None:
+        if scrollback <= 0:
+            raise ValueError(f"--scrollback must be positive, got: {scrollback}")
+        # Capture scrollback history with -J (join wrapped lines for logical lines).
+        # Use a generous -S to grab more than needed, then truncate to exactly N lines.
+        tmux_args = ["capture-pane", "-p", "-J", "-t", session, "-S", f"-{scrollback}"]
         if raw:
-            tmux_args.insert(2, "-e")  # Add -e flag for escape sequences
+            tmux_args.insert(2, "-e")
         res = _run_tmux(tmux_args)
         if not res.ok:
             raise RuntimeError(res.stderr.strip() or "Failed to capture pane")
         output = res.stdout
         if trim:
             output = _trim_output(output)
+        # Truncate to exactly N logical lines (tmux may return more due to
+        # -S being physical-row-based while -J joins wrapped lines).
+        lines = output.split('\n')
+        if len(lines) > scrollback:
+            lines = lines[-scrollback:]
+        output = '\n'.join(lines)
+    elif tail is not None:
+        if tail <= 0:
+            raise ValueError(f"--tail must be positive, got: {tail}")
+        # Capture visible screen without -J (preserve physical rows),
+        # then take the last N rows.
+        output = _capture_screen(session, trim=trim, raw=raw, join_wrapped=False)
+        lines = output.split('\n')
+        if len(lines) > tail:
+            lines = lines[-tail:]
+        output = '\n'.join(lines)
     else:
-        # Capture only visible screen
+        # Capture only visible screen (no -J, physical rows preserved)
         output = _capture_screen(session, trim=trim, raw=raw)
 
     print(output)
@@ -784,7 +817,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     _require_session(session)
     
     # Get comprehensive session and pane info
-    fmt = "#{session_name}\t#{session_created}\t#{session_windows}\t#{session_attached}\t#{pane_width}\t#{pane_height}\t#{pane_pid}"
+    fmt = "#{session_name}\t#{session_created}\t#{session_windows}\t#{session_attached}\t#{pane_width}\t#{pane_height}\t#{pane_pid}\t#{alternate_on}"
     res = _run_tmux(["display-message", "-p", "-t", session, fmt])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to read session info")
@@ -804,6 +837,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     width = safe_int(parts[4]) if len(parts) > 4 else None
     height = safe_int(parts[5]) if len(parts) > 5 else None
     pane_pid = safe_int(parts[6]) if len(parts) > 6 else None
+    alternate_on = parts[7].strip() == "1" if len(parts) > 7 else False
 
     # Get shell name from pane_pid using ps
     shell_name = None
@@ -836,6 +870,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"State: {state}")
     if foreground_command:
         print(f"Foreground: {foreground_command}")
+    print(f"Screen: {'alternate' if alternate_on else 'normal'}")
     if width and height:
         print(f"Size: {width}x{height}")
     print(f"Locked: {'yes' if _is_locked(session) else 'no'}")
@@ -885,6 +920,8 @@ def cmd_scroll(args: argparse.Namespace) -> None:
     _require_session(session)
 
     lines = args.lines
+    if lines == 0:
+        raise ValueError("Scroll lines must be non-zero")
     direction = "up" if lines < 0 else "down"
     abs_lines = abs(lines)
 
@@ -910,7 +947,7 @@ def cmd_wait(args: argparse.Namespace) -> None:
     session = args.session
     _require_session(session)
 
-    timeout = args.timeout if args.timeout else DEFAULT_WAIT_TIMEOUT
+    timeout = args.timeout if args.timeout is not None else DEFAULT_WAIT_TIMEOUT
     if timeout < 0:
         raise ValueError(f"Timeout must be non-negative, got: {timeout}")
     
@@ -926,8 +963,10 @@ def cmd_wait_idle(args: argparse.Namespace) -> None:
     session = args.session
     _require_session(session)
 
-    idle_seconds = args.seconds if args.seconds else DEFAULT_IDLE_SECONDS
-    timeout = args.timeout if args.timeout else DEFAULT_IDLE_TIMEOUT
+    idle_seconds = args.seconds if args.seconds is not None else DEFAULT_IDLE_SECONDS
+    timeout = args.timeout if args.timeout is not None else DEFAULT_IDLE_TIMEOUT
+    if idle_seconds < 0:
+        raise ValueError(f"Idle seconds must be non-negative, got: {idle_seconds}")
     if timeout < 0:
         raise ValueError(f"Timeout must be non-negative, got: {timeout}")
     
@@ -943,7 +982,7 @@ def cmd_wait_for(args: argparse.Namespace) -> None:
     _require_session(session)
 
     patterns = args.patterns
-    timeout = args.timeout if args.timeout else DEFAULT_WAIT_TIMEOUT
+    timeout = args.timeout if args.timeout is not None else DEFAULT_WAIT_TIMEOUT
     ignore_case = args.ignore_case
     capture = args.capture
     
@@ -954,11 +993,6 @@ def cmd_wait_for(args: argparse.Namespace) -> None:
     poll_interval = POLL_INTERVAL_INITIAL
     
     while True:
-        elapsed = time.time() - start
-        if elapsed >= timeout:
-            patterns_str = '", "'.join(patterns)
-            raise OperationTimeout(f'pattern not detected after {timeout}s (searched for: "{patterns_str}")')
-        
         screen = _capture_screen(session, trim=True)
         
         for pattern in patterns:
@@ -973,6 +1007,11 @@ def cmd_wait_for(args: argparse.Namespace) -> None:
                     if capture:
                         print(line)
                     return
+        
+        elapsed = time.time() - start
+        if elapsed >= timeout:
+            patterns_str = '", "'.join(patterns)
+            raise OperationTimeout(f'pattern not detected after {timeout}s (searched for: "{patterns_str}")')
         
         time.sleep(poll_interval)
         # Increase poll interval gradually to reduce CPU usage during long waits
@@ -1062,6 +1101,7 @@ def cmd_request(args: argparse.Namespace) -> None:
     
     # Store request in tmux user option (can be read via #{@term_cli_request} in format strings)
     _run_tmux(["set-option", "-t", session, TERM_CLI_REQUEST_OPT, message])
+    print(f"Request stored for session '{session}'")
 
 
 def cmd_request_wait(args: argparse.Namespace) -> None:
@@ -1073,20 +1113,17 @@ def cmd_request_wait(args: argparse.Namespace) -> None:
     if not _get_request(session):
         raise ValueError(f"No pending request for session '{session}'")
     
-    timeout = args.timeout if args.timeout else DEFAULT_REQUEST_TIMEOUT
+    timeout = args.timeout if args.timeout is not None else DEFAULT_REQUEST_TIMEOUT
     if timeout < 0:
         raise ValueError(f"Timeout must be non-negative, got: {timeout}")
     
     start = time.time()
     
     while True:
-        elapsed = time.time() - start
-        if elapsed >= timeout:
-            raise OperationTimeout(f"human did not respond within {timeout}s")
-        
         # Check if human detached without completing
         if _get_detached(session):
             _clear_detached(session)  # Clear so next request-wait can block
+            elapsed = time.time() - start
             raise HumanDetached(f"term-assist detached without response ({elapsed:.1f}s)")
         
         # Check if request was cleared (completed)
@@ -1096,8 +1133,13 @@ def cmd_request_wait(args: argparse.Namespace) -> None:
             if response:
                 print(f"Response: {response}")
                 _clear_response(session)
+            elapsed = time.time() - start
             print(f"Request completed ({elapsed:.1f}s)")
             return
+        
+        elapsed = time.time() - start
+        if elapsed >= timeout:
+            raise OperationTimeout(f"human did not respond within {timeout}s")
         
         time.sleep(1.0)
 
@@ -1125,8 +1167,7 @@ def cmd_request_status(args: argparse.Namespace) -> None:
     if request:
         print("pending")
     else:
-        print("none")
-        raise RuntimeError("No pending request")
+        raise QueryResult("none")
 
 
 # ----------------------------
@@ -1146,7 +1187,7 @@ Use 'term-cli <command> -h' for command-specific help.
 
 Exit codes: 0=success, 1=runtime error, 2=invalid input, 3=timeout, 4=detached, 5=locked, 127=tmux not found
 
-tmux keys: C-c C-d C-z (ctrl), Enter Escape Space Tab, Up Down Left Right, etc.""",
+tmux keys: C-c C-d C-u C-z (ctrl), Enter Escape Space Tab BSpace, Up Down Left Right, Home End NPage PPage, F1-F12""",
         epilog="""Examples:
   term-cli start --session build --cwd /path/to/project
   term-cli run --session build "make test" --wait --timeout 60
@@ -1216,7 +1257,10 @@ Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var
     # capture
     sp = sub.add_parser("capture", help="Capture screen (visible, trimmed)")
     sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
-    sp.add_argument("-n", "--lines", type=int, metavar="N", help="Last N lines of scrollback")
+    sp.add_argument("-n", "--scrollback", type=int, metavar="N",
+                    help="Last N logical lines from scrollback+visible history (joins wrapped lines)")
+    sp.add_argument("-t", "--tail", type=int, metavar="N",
+                    help="Last N physical rows from bottom of visible screen")
     sp.add_argument("-r", "--raw", action="store_true", help="Include ANSI escape codes (colors)")
     sp.add_argument("--no-trim", action="store_true", help="Keep trailing whitespace")
     sp.set_defaults(func=cmd_capture)
@@ -1348,7 +1392,7 @@ def main(argv: list[str] | None = None) -> int:
             argv[i] = _expand_command(arg)
         except ValueError as e:
             _eprint(f"Error: {e}")
-            return 2
+            return EXIT_INPUT_ERROR
         break
     
     args = parser.parse_args(argv)
@@ -1386,6 +1430,11 @@ def main(argv: list[str] | None = None) -> int:
     except AgentLocked as e:
         _eprint(f"Error: {e}")
         return EXIT_LOCKED
+
+    except QueryResult as e:
+        # Not an error - normal query result printed to stdout, specific exit code
+        print(str(e))
+        return e.exit_code
 
     except RuntimeError as e:
         _eprint(f"Error: {e}")

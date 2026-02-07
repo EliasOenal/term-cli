@@ -275,6 +275,23 @@ def temp_file(tmp_path: Path) -> Path:
     return tmp_path / "output.log"
 
 
+def capture_content(
+    term_cli: Callable[..., RunResult],
+    session: str,
+) -> str:
+    """Capture screen content with wrapped lines joined (via --scrollback).
+
+    Use this for substring assertions on typed/echoed text that may wrap
+    across physical screen rows (e.g. when a long hostname makes the shell
+    prompt exceed the terminal width).
+
+    For testing physical screen layout or capture rendering, use
+    term_cli("capture", "--session", ...) directly instead.
+    """
+    result = term_cli("capture", "--session", session, "--scrollback", "500")
+    return result.stdout
+
+
 def wait_for_content(
     term_cli: Callable[..., RunResult],
     session: str,
@@ -284,12 +301,13 @@ def wait_for_content(
 ) -> bool:
     """
     Wait until the captured screen contains the expected content.
+    Uses scrollback capture to join wrapped lines, so substring matching
+    works regardless of prompt length or terminal width.
     Returns True if found, False if timeout.
     """
     start = time.time()
     while time.time() - start < timeout:
-        result = term_cli("capture", "-s", session)
-        if content in result.stdout:
+        if content in capture_content(term_cli, session):
             return True
         time.sleep(interval)
     return False

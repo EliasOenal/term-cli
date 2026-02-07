@@ -87,8 +87,11 @@ EOF
 # Visible screen (trimmed by default)
 term-cli capture -s dev
 
+# Last N physical rows from visible screen
+term-cli capture -s dev --tail 5
+
 # Include scrollback (-n) and ANSI escapes (-r)
-term-cli capture -s dev -n 250 -r
+term-cli capture -s dev -n 20 -r
 
 # Pipe output to a file; strips ANSI by default (use -r for raw)
 term-cli pipe-log -s dev /tmp/dev.log
@@ -119,7 +122,7 @@ Examples:
 ```bash
 term-cli star -s a -c . -x 100 -y 30
 term-cli ru   -s a -w -t 60 "make test"
-term-cli c    -s a -n 200
+term-cli c    -s a -n 10
 term-cli wait-i -s a -i 2 -t 20
 term-cli request-w -s a -t 300
 ```
@@ -137,8 +140,9 @@ term-cli request-w -s a -t 300
 
 ### `status`
 
-- Prints: session name, idle/running, foreground command (best-effort), size, locked state, attached state, created timestamp, and a process tree.
+- Prints: session name, idle/running, foreground command (best-effort), screen mode (normal/alternate), size, locked state, attached state, created timestamp, and a process tree.
 - “running” is inferred from foreground process markers (best-effort; treat as advisory).
+- “Screen: alternate” means a full-screen TUI (vim, htop, less) is active — use `wait-idle` instead of `wait`.
 
 ### `pipe-log`
 
@@ -160,9 +164,9 @@ term-cli request-w -s a -t 300
 
 ```bash
 term-cli start --session remote && term-cli run --session remote "ssh user@host"
-term-cli wait --session remote --timeout 30 && term-cli capture -s remote  # password prompt or shell (key auth)?
+term-cli wait --session remote && term-cli capture --session remote  # password prompt or shell (key auth)?
 term-cli request --session remote --message "Please complete SSH login (password/MFA)"
-term-cli request-wait --session remote --timeout 300 && term-cli capture --session remote --lines 120
+term-cli request-wait --session remote && term-cli capture --session remote
 ```
 
 ### Human Side
@@ -172,13 +176,13 @@ term-assist list
 term-assist attach --session remote
 # complete the interaction
 # Ctrl+B Enter => done (optional message)
-# Ctrl+B d     => detach without completing (agent sees exit code 4)
+# Ctrl+B d     => detach (if request still pending, agent sees exit code 4)
 ```
 
 ### Locked Sessions
 
 - Create locked: `term-cli start --session NAME --locked`
-- When locked, the agent can only: `capture`, `status`, `wait*`, `request*`, `list`.
+- When locked, the agent can only: `capture`, `status`, `wait*`, `request*`, `list`, `scroll`, `pipe-log`, `unpipe`.
 - Interactive commands (`run`, `send-*`, `resize`, `kill`) return **exit code 5**.
 
 ---
@@ -191,7 +195,7 @@ term-assist attach --session remote
 | 1 | Runtime error (tmux failed, session missing, etc.) |
 | 2 | Invalid input (bad args / validation) |
 | 3 | Timeout (wait condition unmet) |
-| 4 | Human detached without completing request |
+| 4 | Human detached while request pending |
 | 5 | Session locked (agent read-only) |
 | 127 | tmux not found on PATH |
 
@@ -201,6 +205,7 @@ Exception mapping used by the CLI:
 - `OperationTimeout` → 3
 - `HumanDetached` → 4
 - `AgentLocked` → 5
+- `QueryResult` → exit code carried by exception (default 1; non-error query result, printed to stdout)
 - `RuntimeError` → 1
 
 ---
@@ -224,13 +229,16 @@ Exception mapping used by the CLI:
 
 ### Code Quality & Testing
 
-1. **Determine intended behavior first** — don’t assume the app or tests are correct.
+1. **Determine intended behavior first** — don't assume the app or tests are correct.
 2. **Fix the source** — fix app bugs in the app; fix wrong expectations in tests.
-3. **No hacks** — don’t add special-cases just to satisfy assertions.
-4. **No weak tests** — don’t loosen checks to hide broken behavior.
+3. **No hacks** — don't add special-cases just to satisfy assertions.
+4. **No weak tests** — don't loosen checks to hide broken behavior.
 5. **Fix tests when you notice issues** — even if it makes failures visible temporarily.
 6. **Legitimate improvements are not hacks** — validation, clearer errors, and consistent behavior are good engineering.
 7. **Use unique session names in tests** — avoid collisions; always cleanup (e.g., `finally`).
+8. **Flaky tests are bugs.** Never dismiss a test as "flaky" or "pre-existing." Investigate the root cause and fix it — in the test, the app, or both.
+9. **Never push to the remote repository.** The human owner pushes. Agents commit locally only.
+10. **Never commit with broken tests.** Run the full test suite (`./run-tests.sh`) and `pyright` **before** committing. If tests fail, fix them first.
 
 ### Bug Reporting
 

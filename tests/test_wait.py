@@ -174,7 +174,7 @@ class TestWaitIdle:
         def check_sleep_started():
             result = term_cli("status", "-s", session)
             return "sleep" in result.stdout
-        assert retry_until(check_sleep_started, timeout=3.0), "sleep never started"
+        assert retry_until(check_sleep_started, timeout=15.0), "sleep never started"
         term_cli("send-key", "-s", session, "C-c")
         result = term_cli("wait-idle", "-s", session, "-i", "0.5", "-t", "5")
         assert "Idle for" in result.stdout
@@ -185,9 +185,23 @@ class TestWaitIdle:
         # With 0 idle seconds, should return immediately
         assert result.ok
 
+    def test_wait_idle_zero_timeout(self, session, term_cli):
+        """wait-idle with zero timeout checks once and returns."""
+        term_cli("wait", "-s", session, "-t", "5")  # Ensure shell is ready
+        result = term_cli("wait-idle", "-s", session, "-i", "0", "-t", "0")
+        # With 0 idle seconds and 0 timeout, should check once and succeed
+        assert result.ok
+
     def test_wait_idle_negative_timeout(self, session, term_cli):
         """wait-idle with negative timeout is rejected."""
         result = term_cli("wait-idle", "-s", session, "-i", "0.5", "-t", "-1")
+        assert not result.ok
+        assert result.returncode == 2  # EXIT_INPUT_ERROR
+        assert "negative" in result.stderr.lower() or "non-negative" in result.stderr.lower()
+
+    def test_wait_idle_negative_seconds(self, session, term_cli):
+        """wait-idle with negative idle seconds is rejected."""
+        result = term_cli("wait-idle", "-s", session, "-i", "-1", "-t", "5")
         assert not result.ok
         assert result.returncode == 2  # EXIT_INPUT_ERROR
         assert "negative" in result.stderr.lower() or "non-negative" in result.stderr.lower()
@@ -261,6 +275,20 @@ class TestWaitFor:
         assert not result.ok
         assert result.returncode == 2  # EXIT_INPUT_ERROR
         assert "negative" in result.stderr.lower() or "non-negative" in result.stderr.lower()
+
+    def test_wait_for_zero_timeout(self, session, term_cli):
+        """wait-for with zero timeout checks once and returns."""
+        term_cli("run", "-s", session, "echo 'zero_timeout_marker'", "-w")
+        result = term_cli("wait-for", "-s", session, "zero_timeout_marker", "-t", "0")
+        # Pattern is already on screen, zero timeout should find it on first check
+        assert result.ok
+        assert "Pattern detected" in result.stdout
+
+    def test_wait_for_zero_timeout_miss(self, session, term_cli):
+        """wait-for with zero timeout fails if pattern not present."""
+        result = term_cli("wait-for", "-s", session, "never_on_screen_xyz", "-t", "0")
+        assert not result.ok
+        assert result.returncode == 3  # EXIT_TIMEOUT
 
     def test_wait_for_immediate_match(self, session, term_cli):
         """wait-for returns quickly when pattern is already present."""

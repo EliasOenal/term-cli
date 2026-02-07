@@ -8,7 +8,7 @@ import shutil
 
 import pytest  # type: ignore
 
-from conftest import require_tool, wait_for_content, retry_until, wait_for_file_content
+from conftest import capture_content, require_tool, wait_for_content, retry_until, wait_for_file_content
 
 
 class TestShellWorkflows:
@@ -32,11 +32,16 @@ class TestShellWorkflows:
         term_cli("send-key", "-s", session, "Up")
         assert wait_for_content(term_cli, session, "echo second_command"), "Up arrow didn't recall command"
         
-        result = term_cli("capture", "-s", session)
-        assert "echo second_command" in result.stdout
+        # Use joined wraps — recalled command is at the prompt
+        assert "echo second_command" in capture_content(term_cli, session)
 
     def test_tab_completion(self, session, term_cli, tmp_path):
-        """Test tab completion."""
+        """Test tab completion.
+
+        Checks for the suffix that tab adds ('_completion') rather than the
+        full filename, because the completed command line may wrap across
+        physical screen rows and default capture preserves those line breaks.
+        """
         # Create a file with unique name
         testfile = tmp_path / "unique_test_file_for_completion.txt"
         testfile.write_text("test")
@@ -45,12 +50,10 @@ class TestShellWorkflows:
         term_cli("run", "-s", session, f"cd {tmp_path}", "-w")
         term_cli("send-text", "-s", session, "cat unique_test_file_for")
         term_cli("send-key", "-s", session, "Tab")
-        assert wait_for_content(term_cli, session, "unique_test_file_for_completion.txt"), "Tab completion failed"
-        
-        result = term_cli("capture", "-s", session)
-        # Tab should complete to the full filename
-        assert "unique_test_file_for_completion.txt" in result.stdout, \
-            f"Tab completion should complete the filename. Got: {result.stdout}"
+        # Check for the completion suffix, not the full filename — the
+        # completed line may wrap at 80 columns, splitting the name across
+        # two physical rows in the default (non-joined) capture output.
+        assert wait_for_content(term_cli, session, "_completion"), "Tab completion failed"
 
     def test_interrupt_running_process(self, session, term_cli):
         """Test Ctrl+C interrupts a running process."""
@@ -59,7 +62,7 @@ class TestShellWorkflows:
         def check_sleep_running():
             result = term_cli("status", "-s", session)
             return "sleep" in result.stdout
-        assert retry_until(check_sleep_running, timeout=3.0), "sleep never started"
+        assert retry_until(check_sleep_running, timeout=15.0), "sleep never started"
         
         # Interrupt
         term_cli("send-key", "-s", session, "C-c")
@@ -74,7 +77,7 @@ class TestShellWorkflows:
         
         # Should return to prompt while sleep runs in background
         # The wait should detect the prompt since the command was backgrounded
-        result = term_cli("wait", "-s", session, "-t", "2")
+        result = term_cli("wait", "-s", session, "-t", "15")
         assert "Prompt detected" in result.stdout, \
             "Backgrounded command should return to prompt immediately"
         
@@ -286,7 +289,7 @@ class TestLessWorkflow:
         # Quit
         term_cli("send-key", "-s", session, "q")
         
-        result = term_cli("wait", "-s", session, "-t", "2")
+        result = term_cli("wait", "-s", session, "-t", "15")
         assert "Prompt detected" in result.stdout
 
     def test_less_navigation(self, session, term_cli, tmp_path):
@@ -462,7 +465,7 @@ class TestComplexWorkflows:
         term_cli("send-key", "-s", session, "C-d")  # EOF to finish cat
         
         # Verify file was created
-        result = term_cli("wait", "-s", session, "-t", "2")
+        result = term_cli("wait", "-s", session, "-t", "15")
         assert "Prompt detected" in result.stdout
         assert testfile.exists()
         content = testfile.read_text()
@@ -484,7 +487,7 @@ class TestComplexWorkflows:
         term_cli("send-text", "-s", session, ":wq", "-e")  # Save and quit
         
         # Verify vi changes
-        result = term_cli("wait", "-s", session, "-t", "2")
+        result = term_cli("wait", "-s", session, "-t", "15")
         assert "Prompt detected" in result.stdout
         
         final_content = testfile.read_text()

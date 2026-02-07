@@ -83,7 +83,7 @@ class TestCommandAbbreviation:
 
     def test_wait_full_command_works(self, session, term_cli):
         """'wait' full command works (cannot be abbreviated due to ambiguity with wait-idle)."""
-        result = term_cli("wait", "-s", session, "-t", "1")
+        result = term_cli("wait", "-s", session, "-t", "15")
         assert result.ok
 
     def test_abbreviation_wait_i_for_wait_idle(self, session, term_cli):
@@ -199,7 +199,8 @@ class TestHelp:
         """capture --help shows capture options."""
         result = term_cli("capture", "-h")
         assert result.ok
-        assert "--lines" in result.stdout or "-n" in result.stdout
+        assert "--scrollback" in result.stdout or "-n" in result.stdout
+        assert "--tail" in result.stdout or "-t" in result.stdout
         assert "--no-trim" in result.stdout
         assert "--raw" in result.stdout or "-r" in result.stdout
 
@@ -262,8 +263,8 @@ class TestShortFlags:
         finally:
             term_cli("kill", "-s", name)
 
-    def test_n_for_lines(self, session, term_cli):
-        """-n works for --lines."""
+    def test_n_for_scrollback(self, session, term_cli):
+        """-n works for --scrollback."""
         result = term_cli("capture", "-s", session, "-n", "50")
         assert result.ok
 

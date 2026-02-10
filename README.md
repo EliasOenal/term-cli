@@ -1,8 +1,9 @@
-# term-cli
+<p align="center">
+  <img src="assets/term-cli.svg" alt="term-cli" width="150">
+  <img src="assets/challenge.webp" alt="term-cli challenge demo">
+</p>
 
-![term-cli challenge demo](assets/challenge.webp)
-
-**Unlocks interactive terminals for AI agents**
+**term-cli: unlock interactive terminals for AI agents**
 
 If it blocks in a terminal, it blocks your agent.
 

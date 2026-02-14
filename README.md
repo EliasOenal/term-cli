@@ -190,8 +190,8 @@ Works with **Claude Code**, **Gemini CLI**, **Cursor**, **Aider**, **OpenCode**,
 | `send-stdin --session NAME < file.txt` | Send multiline content |
 | `capture --session NAME` | Capture screen (--tail/--scrollback for more) |
 | `wait --session NAME --timeout 30` | Wait for prompt |
-| `wait-idle --session NAME --seconds 2` | Wait for output to settle |
-| `wait-for --session NAME "pattern"` | Wait for text to appear |
+| `wait-idle --session NAME --idle 2` | Wait for output to settle |
+| `wait-for --session NAME "pattern"` | Wait for text to appear (--print-match/--print-match-context N) |
 | `resize --session NAME --cols 120 --rows 40` | Resize terminal |
 | `scroll --session NAME -50` | Scroll viewport (negative=up) |
 | `pipe-log --session NAME /tmp/out.log` | Stream output to file |

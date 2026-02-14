@@ -251,10 +251,10 @@ class TestWaitFor:
         assert result.ok
         assert "Pattern detected" in result.stdout
 
-    def test_wait_for_capture_flag(self, session, term_cli):
-        """wait-for --capture prints the matched line."""
+    def test_wait_for_print_match_flag(self, session, term_cli):
+        """wait-for --print-match prints the matched line."""
         term_cli("run", "-s", session, "echo 'line with marker here'", "-w")
-        result = term_cli("wait-for", "-s", session, "marker", "-c", "-t", "5")
+        result = term_cli("wait-for", "-s", session, "marker", "-p", "-t", "5")
         assert result.ok
         assert "Pattern detected" in result.stdout
         # The captured line should contain the full context
@@ -262,6 +262,39 @@ class TestWaitFor:
         # Output should have at least two lines (detection message + captured line)
         lines = result.stdout.strip().split('\n')
         assert len(lines) >= 2
+
+    def test_wait_for_print_match_context(self, session, term_cli):
+        """wait-for --print-match-context prints surrounding lines."""
+        # Use printf to build the marker so it doesn't appear in the echoed command
+        term_cli("run", "-s", session,
+                 "echo 'aaa'; echo 'bbb'; printf 'cc%s\\n' 'c'; echo 'ddd'; echo 'eee'",
+                 "-w")
+        result = term_cli("wait-for", "-s", session, "ccc", "-C", "1", "-t", "5")
+        assert result.ok
+        assert "Pattern detected" in result.stdout
+        lines = result.stdout.strip().split('\n')
+        # First line is the detection message, remaining lines are context
+        context_lines = lines[1:]
+        assert len(context_lines) == 3  # bbb, ccc, ddd
+        assert any("bbb" in l for l in context_lines)
+        assert any("ccc" in l for l in context_lines)
+        assert any("ddd" in l for l in context_lines)
+
+    def test_wait_for_print_match_context_implies_print(self, session, term_cli):
+        """wait-for -C implies --print-match (no need for -p)."""
+        term_cli("run", "-s", session, "echo 'ctx_marker_line'", "-w")
+        result = term_cli("wait-for", "-s", session, "ctx_marker_line", "-C", "0", "-t", "5")
+        assert result.ok
+        lines = result.stdout.strip().split('\n')
+        # -C 0 means just the matched line (same as -p alone)
+        assert len(lines) >= 2  # detection message + matched line
+        assert any("ctx_marker_line" in l for l in lines[1:])
+
+    def test_wait_for_print_match_context_negative(self, session, term_cli):
+        """wait-for --print-match-context with negative value is rejected."""
+        result = term_cli("wait-for", "-s", session, "pattern", "-C", "-1", "-t", "5")
+        assert not result.ok
+        assert result.returncode == 2  # EXIT_INPUT_ERROR
 
     def test_wait_for_nonexistent_session(self, term_cli):
         """wait-for on non-existent session raises error."""

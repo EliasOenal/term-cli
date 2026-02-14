@@ -53,8 +53,8 @@ Quick reference:
   term-cli send-text --session NAME "text" [--enter]
   term-cli send-stdin --session NAME < file.txt
   term-cli wait --session NAME [--timeout 10]
-  term-cli wait-idle --session NAME [--seconds 2] [--timeout 10]
-  term-cli wait-for --session NAME PATTERN [--timeout 10] [--ignore-case] [--capture]
+  term-cli wait-idle --session NAME [--idle 2] [--timeout 10]
+  term-cli wait-for --session NAME PATTERN [--timeout 10] [--ignore-case] [--print-match] [--print-match-context N]
   term-cli status --session NAME
   term-cli resize --session NAME [--cols N] [--rows N]
   term-cli pipe-log --session NAME FILE [--raw]
@@ -75,8 +75,8 @@ Human assistance (request/response):
 Note: wait-for searches the entire visible screen, including the command echo line.
 
 Short flags: -s (session), -w (wait), -t (timeout/tail), -x (cols), -y (rows),
-             -c (cwd), -n (scrollback), -e (enter/env), -r (raw), -i (idle seconds/ignore-case),
-             -m (message), -f (force), -l (locked)
+             -c (cwd), -n (scrollback), -e (enter/env), -r (raw), -i (idle/ignore-case),
+             -p (print-match), -C (print-match-context), -m (message), -f (force), -l (locked)
 """
 
 from __future__ import annotations
@@ -968,7 +968,7 @@ def cmd_wait_idle(args: argparse.Namespace) -> None:
     session = args.session
     _require_session(session)
 
-    idle_seconds = args.seconds if args.seconds is not None else DEFAULT_IDLE_SECONDS
+    idle_seconds = args.idle if args.idle is not None else DEFAULT_IDLE_SECONDS
     timeout = args.timeout if args.timeout is not None else DEFAULT_IDLE_TIMEOUT
     if idle_seconds < 0:
         raise ValueError(f"Idle seconds must be non-negative, got: {idle_seconds}")
@@ -989,7 +989,12 @@ def cmd_wait_for(args: argparse.Namespace) -> None:
     patterns = args.patterns
     timeout = args.timeout if args.timeout is not None else DEFAULT_WAIT_TIMEOUT
     ignore_case = args.ignore_case
-    capture = args.capture
+    print_match = args.print_match
+    context = args.print_match_context
+    if context is not None:
+        if context < 0:
+            raise ValueError(f"Context lines must be non-negative, got: {context}")
+        print_match = True  # --print-match-context implies --print-match
     
     if timeout < 0:
         raise ValueError(f"Timeout must be non-negative, got: {timeout}")
@@ -999,18 +1004,25 @@ def cmd_wait_for(args: argparse.Namespace) -> None:
     
     while True:
         screen = _capture_screen(session, trim=True)
+        lines = screen.split('\n')
         
         for pattern in patterns:
             # Check each line for the pattern
-            for line in screen.split('\n'):
+            for idx, line in enumerate(lines):
                 check_line = line.lower() if ignore_case else line
                 check_pattern = pattern.lower() if ignore_case else pattern
                 
                 if check_pattern in check_line:
                     elapsed = time.time() - start
                     print(f'Pattern detected ({elapsed:.1f}s): "{pattern}"')
-                    if capture:
-                        print(line)
+                    if print_match:
+                        if context is not None and context > 0:
+                            ctx_start = max(0, idx - context)
+                            ctx_end = min(len(lines), idx + context + 1)
+                            for ctx_line in lines[ctx_start:ctx_end]:
+                                print(ctx_line)
+                        else:
+                            print(line)
                     return
         
         elapsed = time.time() - start
@@ -1203,7 +1215,7 @@ tmux keys: C-c C-d C-u C-z (ctrl), Enter Escape Space Tab BSpace, Up Down Left R
 
 Short forms (commands and flags can be abbreviated):
   term-cli send-t -s b ":wq" -e      # send-text --session b ":wq" --enter
-  term-cli wait-i -s b -i 3 -t 5     # wait-idle --session b --seconds 3 --timeout 5
+  term-cli wait-i -s b -i 3 -t 5     # wait-idle --session b --idle 3 --timeout 5
 
 Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var'""",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1314,7 +1326,7 @@ Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var
     # wait-idle
     sp = sub.add_parser("wait-idle", help="Wait for output to stop")
     sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
-    sp.add_argument("-i", "--seconds", type=float, metavar="SEC", help=f"Idle time (default: {DEFAULT_IDLE_SECONDS})")
+    sp.add_argument("-i", "--idle", type=float, metavar="SEC", help=f"Idle threshold (default: {DEFAULT_IDLE_SECONDS})")
     sp.add_argument("-t", "--timeout", type=float, metavar="SEC", help=f"Max wait (default: {DEFAULT_IDLE_TIMEOUT})")
     sp.set_defaults(func=cmd_wait_idle)
 
@@ -1324,7 +1336,8 @@ Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var
     sp.add_argument("patterns", nargs="+", metavar="PATTERN", help="Pattern(s) to wait for (first match wins)")
     sp.add_argument("-t", "--timeout", type=float, metavar="SEC", help=f"Timeout (default: {DEFAULT_WAIT_TIMEOUT})")
     sp.add_argument("-i", "--ignore-case", action="store_true", help="Case-insensitive matching")
-    sp.add_argument("-c", "--capture", action="store_true", help="Also print the matched line")
+    sp.add_argument("-p", "--print-match", action="store_true", help="Print the matched line")
+    sp.add_argument("-C", "--print-match-context", type=int, metavar="N", help="Print N lines of context around match (implies --print-match)")
     sp.set_defaults(func=cmd_wait_for)
 
     # request

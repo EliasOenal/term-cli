@@ -57,10 +57,11 @@ term-cli wait -s dev -t 15
 
 # TUIs / no prompt: wait until output settles
 term-cli run -s dev "htop"          # no -w here
-term-cli wait-idle -s dev -i 2 -t 30 # idle seconds + max timeout
+term-cli wait-idle -s dev -i 2 -t 30 # idle threshold + max timeout
 
 # Wait for one of multiple substrings (screen match, not regex)
-term-cli wait-for -s dev -t 30 -i -c "Listening on" "Ready" "Error"
+term-cli wait-for -s dev -t 30 -i -p "Listening on" "Ready" "Error"
+term-cli wait-for -s dev -t 30 -C 3 "Error"  # print match + 3 lines of context
 ```
 
 ### Input

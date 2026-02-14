@@ -570,7 +570,7 @@ sleep 10
         term_cli("run", "-s", session, str(script))
         
         # Wait for the ready message
-        result = term_cli("wait-for", "-s", session, "Server ready", "-t", "10", "-c")
+        result = term_cli("wait-for", "-s", session, "Server ready", "-t", "10", "-p")
         assert result.ok
         assert "Pattern detected" in result.stdout
         assert "Server ready on port 8080" in result.stdout

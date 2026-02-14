@@ -85,7 +85,8 @@ term-cli wait-idle --session NAME                                      # default
 **Use `wait-for` sparingly** — waits for pattern in screen output:
 
 ```bash
-term-cli wait-for --session NAME "error" "success" --ignore-case --capture
+term-cli wait-for --session NAME "error" "success" --ignore-case --print-match
+term-cli wait-for --session NAME "error" --print-match-context 3             # match + 3 lines above/below
 ```
 
 ⚠️ **Warning:** `wait-for` matches the entire screen including your echoed command:

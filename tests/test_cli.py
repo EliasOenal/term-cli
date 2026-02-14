@@ -290,8 +290,8 @@ class TestShortFlags:
         assert result.ok
         term_cli("unpipe", "-s", session)
 
-    def test_i_for_seconds(self, session, term_cli):
-        """-i works for --seconds (idle)."""
+    def test_i_for_idle(self, session, term_cli):
+        """-i works for --idle."""
         result = term_cli("wait-idle", "-s", session, "-i", "0.5", "-t", "2")
         assert result.ok
 

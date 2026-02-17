@@ -450,24 +450,101 @@ class TestWaitCursorDetection:
         capture = term_cli("capture", "-s", session)
         assert "array[0]" in capture.stdout
 
+    def test_wait_detects_prompt_wrapped_at_last_column(self, session, term_cli):
+        """Prompt char ($) at last column, trailing space + cursor wrap.
+
+        PS1 = 78 filler + "$ "  →  $ at col 78 (0-indexed), space at col 79,
+        cursor wraps to (1, y+1) or (0, y+1) depending on tmux version.
+        The prompt char is the last non-space character on the previous line.
+
+        Regression test for CI runners with long hostnames where the prompt
+        exceeded 80 columns at exactly the $ boundary.
+        """
+        filler = "A" * 78
+        term_cli(
+            "run", "-s", session, "-w", "-t", "5",
+            f"export PS1='{filler}\\$ '",
+            check=True,
+        )
+
+        term_cli("send-text", "-s", session, "echo wrap_last_col", "-e")
+        result = term_cli("wait", "-s", session, "-t", "5")
+        assert result.ok, (
+            f"Prompt not detected ($ at last col): {result.stderr}"
+        )
+        capture = term_cli("capture", "-s", session)
+        assert "wrap_last_col" in capture.stdout
+
+    def test_wait_detects_prompt_space_at_last_column(self, session, term_cli):
+        """Prompt char ($) at second-to-last column, space at last, cursor wraps.
+
+        PS1 = 77 filler + "$ "  →  $ at col 77, space at col 78, cursor at
+        col 79.  No wrap — normal _cursor_at_prompt handles this.  Included
+        to confirm the boundary is correct.
+        """
+        filler = "B" * 77
+        term_cli(
+            "run", "-s", session, "-w", "-t", "5",
+            f"export PS1='{filler}\\$ '",
+            check=True,
+        )
+
+        term_cli("send-text", "-s", session, "echo no_wrap_78", "-e")
+        result = term_cli("wait", "-s", session, "-t", "5")
+        assert result.ok, (
+            f"Prompt not detected ($ at col 77, no wrap): {result.stderr}"
+        )
+        capture = term_cli("capture", "-s", session)
+        assert "no_wrap_78" in capture.stdout
+
+    def test_wait_detects_prompt_entire_suffix_wraps(self, session, term_cli):
+        """Filler fills entire line, "$ " wraps to next line as a unit.
+
+        PS1 = 80 filler + "$ "  →  filler fills cols 0-79, "$ " starts at
+        col 0 of the next line, cursor at col 2.  Normal _cursor_at_prompt
+        handles this (no special wrap logic needed).
+        """
+        filler = "D" * 80
+        term_cli(
+            "run", "-s", session, "-w", "-t", "5",
+            f"export PS1='{filler}\\$ '",
+            check=True,
+        )
+
+        term_cli("send-text", "-s", session, "echo full_line_wrap", "-e")
+        result = term_cli("wait", "-s", session, "-t", "5")
+        assert result.ok, (
+            f"Prompt not detected (full line + wrap): {result.stderr}"
+        )
+        capture = term_cli("capture", "-s", session)
+        assert "full_line_wrap" in capture.stdout
+
 
 class TestCursorAtPromptUnit:
     """Unit tests for the _cursor_at_prompt function.
     
     These tests verify the prompt detection heuristic without needing actual
     REPLs or terminal sessions. The function checks if the cursor is positioned
-    at a prompt by looking at character positions relative to the cursor.
+    at a prompt by looking at character positions relative to the cursor,
+    including the wrap case where the prompt char is on the previous line.
     """
 
     @pytest.fixture(scope="class")
-    def cursor_at_prompt(self) -> Callable[[str, int], bool]:
+    def cursor_at_prompt(self) -> Callable[..., bool]:
         """Import _cursor_at_prompt from term-cli executable."""
         from importlib.machinery import SourceFileLoader
         
         term_cli_path = Path(__file__).parent.parent / "term-cli"
         loader = SourceFileLoader("term_cli_module", str(term_cli_path))
         module = loader.load_module()
-        return module._cursor_at_prompt  # type: ignore[attr-defined,no-any-return]
+        fn = module._cursor_at_prompt  # type: ignore[attr-defined]
+
+        def _call(line: str, cursor_x: int) -> bool:
+            """Single-line convenience wrapper."""
+            return fn([line], cursor_x, 0)  # type: ignore[no-any-return]
+
+        _call.raw = fn  # type: ignore[attr-defined]
+        return _call
 
     # ==================== Shell Prompts ====================
     
@@ -663,3 +740,33 @@ class TestCursorAtPromptUnit:
             f"Expected match (known false positive): {desc}. "
             "If this fails, the heuristic changed - update test or docs."
         )
+
+    # ==================== Wrap Edge Cases ====================
+
+    @pytest.mark.parametrize("prev_line,cursor_x,expected,desc", [
+        ("user@host:~$", 0, True, "dollar at end, cursor wraps to x=0"),
+        ("user@host:~$", 1, True, "dollar at end, cursor wraps to x=1"),
+        ("long-prompt#", 0, True, "hash at end, cursor wraps to x=0"),
+        ("long-prompt%", 1, True, "percent at end, cursor wraps to x=1"),
+        ("long-prompt>", 0, True, "gt at end, cursor wraps to x=0"),
+        ("no-prompt-char", 0, False, "prev line has no prompt char"),
+        ("", 0, False, "prev line is empty"),
+        ("text ending with space ", 0, False, "prev line ends with space"),
+    ])
+    def test_wrap_cases(self, cursor_at_prompt, prev_line, cursor_x, expected, desc):
+        """Prompt char at end of previous line, cursor wrapped to next line."""
+        fn = cursor_at_prompt.raw
+        lines = [prev_line, ""]
+        assert fn(lines, cursor_x, 1) == expected, f"wrap case: {desc}"
+
+    def test_wrap_no_previous_line(self, cursor_at_prompt):
+        """Cursor at x=0, y=0 — no previous line to check."""
+        fn = cursor_at_prompt.raw
+        assert not fn([""], 0, 0)
+
+    def test_wrap_ignored_when_cursor_x_ge_2(self, cursor_at_prompt):
+        """Wrap logic only applies when cursor_x <= 1."""
+        fn = cursor_at_prompt.raw
+        lines = ["user@host:~$", "   "]
+        # cursor_x=3 on line 1 — should use normal check, not wrap
+        assert not fn(lines, 3, 1)

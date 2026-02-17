@@ -51,6 +51,7 @@ htmlcov/
 # Logs
 *.log
 /tmp/
+_tmp/
 
 # Local development
 .env

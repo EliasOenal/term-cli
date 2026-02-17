@@ -20,7 +20,7 @@ Hand control to humans for passwords and MFA prompts. Or flip it: human drives w
 - **term-cli**: Agents run interactive programs in detached terminal sessions (tmux-backed)
 - **term-assist**: Humans collaborate, enter passwords, handle MFA, prepare sessions
 
-Single-file Python. No dependencies beyond tmux. 400+ tests, CI on every commit. BSD licensed.
+Single-file Python. No dependencies beyond tmux. 550+ tests, CI on every commit. BSD licensed.
 
 ## The Problem
 
@@ -196,6 +196,8 @@ Works with **Claude Code**, **Gemini CLI**, **Cursor**, **Aider**, **OpenCode**,
 | `scroll --session NAME -50` | Scroll viewport (negative=up) |
 | `pipe-log --session NAME /tmp/out.log` | Stream output to file |
 | `unpipe --session NAME` | Stop streaming |
+| `upload --session NAME local.txt remote.txt` | Upload file to session (gzip-compressed, SHA-256 verified) |
+| `download --session NAME remote.txt local.txt` | Download file from session (gzip-compressed, SHA-256 verified) |
 | `request --session NAME --message "help"` | Request human assistance |
 | `request-wait --session NAME` | Wait for human to complete |
 | `request-status --session NAME` | Check if request pending |
@@ -211,8 +213,7 @@ Run `term-cli --help` or `term-cli <command> --help` for details.
 
 | Command | Description |
 |---------|-------------|
-| `list` | List sessions with pending requests |
-| `list --all` | List all sessions |
+| `list` | List all sessions (highlights pending requests) |
 | `attach --session NAME` | Join session with status bar UI |
 | `attach --session NAME --readonly` | Observe without typing |
 | `done --session NAME` | Mark request complete (with optional message) |
@@ -246,6 +247,17 @@ term-cli kill --session server
 term-cli start --session debug && term-cli run --session debug "python3 -m pdb script.py"
 term-cli wait -s debug && term-cli send-text -s debug "b 42" --enter && term-cli wait -s debug
 term-cli send-text -s debug "c" --enter && term-cli wait -s debug && term-cli capture -s debug
+```
+
+## Example: File Transfer (over SSH)
+
+```bash
+term-cli start --session remote && term-cli run --session remote "ssh user@server" --wait
+term-cli upload --session remote ./deploy.tar.gz /tmp/deploy.tar.gz
+term-cli download --session remote /var/log/app.log ./app.log
+# Pipe support
+cat config.json | term-cli upload --session remote - /app/config.json
+term-cli download --session remote /app/data.csv - | head -5
 ```
 
 ## Example: SSH with Password (Agent + Human)
@@ -293,6 +305,7 @@ term-cli kill --session prod
 - **Human collaboration**: `request`/`request-wait` + term-assist for passwords, MFA prompts, manual steps
 - **Locked sessions**: Human controls, agent observes (start with `--locked` or use `term-assist lock`)
 - **Dimension preservation**: Human joining doesn't resize agent's terminal
+- **File transfer**: `upload`/`download` with gzip compression, SHA-256 verification, and pipe support (`-` for stdin/stdout)
 - **Clean output**: Visible screen only, whitespace trimmed, `--scrollback N` for history
 - **Self-documenting**: `--help` on every command
 

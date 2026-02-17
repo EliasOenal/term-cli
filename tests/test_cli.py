@@ -99,8 +99,8 @@ class TestCommandAbbreviation:
         term_cli("u", "-s", session)  # unpipe
 
     def test_abbreviation_u_for_unpipe(self, session, term_cli):
-        """'u' abbreviates to 'unpipe'."""
-        result = term_cli("u", "-s", session)
+        """'un' abbreviates to 'unpipe' ('u' is now ambiguous with 'upload')."""
+        result = term_cli("un", "-s", session)
         assert result.ok
 
     def test_abbreviation_send_t_for_send_text(self, session, term_cli):
@@ -140,6 +140,14 @@ class TestCommandAbbreviation:
         result = term_cli("send", "-s", "test", "arg")
         assert not result.ok
         assert "Ambiguous command" in result.stderr
+
+    def test_ambiguous_u_fails(self, term_cli):
+        """'u' is ambiguous (unpipe, upload)."""
+        result = term_cli("u", "-s", "test")
+        assert not result.ok
+        assert "Ambiguous command" in result.stderr
+        assert "unpipe" in result.stderr
+        assert "upload" in result.stderr
 
     def test_unknown_command_fails(self, term_cli):
         """Unknown command fails with appropriate error."""

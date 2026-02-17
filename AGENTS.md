@@ -102,6 +102,26 @@ term-cli unpipe  -s dev
 term-cli scroll -s dev -50
 ```
 
+### File Transfer
+
+```bash
+# Upload file (gzip-compressed, SHA-256 verified; requires python3 on target)
+term-cli upload -s dev local.txt remote.txt -t 30
+
+# Download from session
+term-cli download -s dev remote.txt local.txt -t 30
+
+# Overwrite existing
+term-cli upload -s dev config.json config.json -f
+
+# Pipe support
+cat data.json | term-cli upload -s dev - /app/data.json
+term-cli download -s dev /app/output.csv - | head -5
+
+# Verbose (shows compression ratio, hash verification)
+term-cli upload -s dev archive.tar.gz archive.tar.gz -v
+```
+
 ---
 
 ## Abbreviations (Prefix Matching)
@@ -112,11 +132,13 @@ Any **unambiguous prefix** works.
 - `st`, `sta` → **start** vs **status**
 - `re` → **resize** vs **request***
 - `req` → **request**, **request-wait**, **request-cancel**, **request-status**
+- `u` → **unpipe** vs **upload**
 
 **Recommended short forms:**
 - `star` = `start`, `stat` = `status`, `res` = `resize`
 - `send-t` = `send-text`, `send-k` = `send-key`, `send-s` = `send-stdin`
 - `wait-i` = `wait-idle`, `wait-f` = `wait-for`
+- `un` = `unpipe`, `up` = `upload`, `d` = `download`
 - `request` (full), `request-w` / `request-c` / `request-s`
 
 Examples:
@@ -184,7 +206,7 @@ term-assist attach --session remote
 
 - Create locked: `term-cli start --session NAME --locked`
 - When locked, the agent can only: `capture`, `status`, `wait*`, `request*`, `list`, `scroll`, `pipe-log`, `unpipe`.
-- Interactive commands (`run`, `send-*`, `resize`, `kill`) return **exit code 5**.
+- Interactive commands (`run`, `send-*`, `resize`, `kill`, `upload`, `download`) return **exit code 5**.
 
 ---
 
@@ -363,3 +385,29 @@ clients" errors during cleanup.
 
 **Examples:** `test_session.py::TestKill::test_kill_all_atomicity`,
 `test_assist.py::TestAttachPreservesSize`.
+
+### TTY testing via nested invocation
+
+The nested pattern is also useful for testing `isatty()` guards.  Running a
+command *inside* a term-cli session gives it a real TTY on stdin/stdout,
+unlike `subprocess.run()` which provides pipes.
+
+```python
+helper = unique_session_name()
+term_cli("start", "-s", helper, "-x", "80", "-y", "24", check=True)
+wait_for_prompt(term_cli, helper, timeout=5)
+try:
+    # Run term-cli upload with '-' inside the helper — stdin is a TTY
+    cmd = (
+        f"{sys.executable} {TERM_CLI}"
+        f" -L {tmux_socket} upload -s {target} - dest.txt -t 5"
+        f"; echo EXIT_CODE=$?"
+    )
+    term_cli("run", "-s", helper, cmd, "-w", "-t", "10", check=True)
+    screen = term_cli("capture", "-s", helper, "-n", "20").stdout
+    assert "EXIT_CODE=2" in screen
+finally:
+    term_cli("kill", "-s", helper, "-f")
+```
+
+**Example:** `test_transfer.py::TestPipeSupport::test_upload_stdin_tty_rejected`.

@@ -32,7 +32,7 @@ class TestLockedSessionStart:
         
         # Check the tmux option directly
         check = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-t", session, "-qv", "@term_cli_agent_locked"],
+            ["tmux", "-L", tmux_socket, "show-option", "-t", f"={session}:", "-qv", "@term_cli_agent_locked"],
             capture_output=True,
             text=True,
         )
@@ -270,7 +270,7 @@ class TestTermAssistListLocked:
         session = unique_session_name()
         term_cli("start", "-s", session, "-l")
         
-        result = term_assist("list", "-a")
+        result = term_assist("list")
         assert result.ok
         assert "[LOCKED]" in result.stdout
         

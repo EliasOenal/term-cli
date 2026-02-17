@@ -53,19 +53,14 @@ def unique_session_name() -> str:
 
 
 def cleanup_session(tmux_socket: str, name: str, term_cli: Callable[..., RunResult]) -> None:
-    """Clean up a session, handling tmux window-size bug workaround.
+    """Clean up a session before killing it.
     
     This handles:
     1. Unlocking the session (in case test locked it via term-assist)
-    2. Unsetting per-session window-size (term-assist attach sets it to 'manual')
-    3. Killing the session
+    2. Killing the session
     """
     subprocess.run(
-        ["tmux", "-L", tmux_socket, "set-option", "-t", name, "-u", "@term_cli_agent_locked"],
-        capture_output=True,
-    )
-    subprocess.run(
-        ["tmux", "-L", tmux_socket, "set-option", "-t", name, "-u", "window-size"],
+        ["tmux", "-L", tmux_socket, "set-option", "-t", f"={name}:", "-u", "@term_cli_agent_locked"],
         capture_output=True,
     )
     term_cli("kill", "-s", name)

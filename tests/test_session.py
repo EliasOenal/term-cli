@@ -315,7 +315,7 @@ class TestKill:
             # Wait for the client to register as attached on s2
             def s2_has_client() -> bool:
                 res = subprocess.run(
-                    ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", s2,
+                    ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", f"={s2}:",
                      "#{session_attached}"],
                     capture_output=True, text=True,
                 )

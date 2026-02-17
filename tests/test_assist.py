@@ -73,10 +73,9 @@ class TestHelp:
         assert "--readonly" in result.stdout or "-r" in result.stdout
 
     def test_list_help(self):
-        """List help shows --all option."""
+        """List help is available."""
         result = _run_term_assist("list", "--help")
         assert result.ok
-        assert "--all" in result.stdout or "-a" in result.stdout
 
 
 class TestCommandAbbreviation:
@@ -179,21 +178,20 @@ class TestList:
         assert session in result.stdout
         assert "Test request message" in result.stdout
 
-    def test_list_all_shows_sessions_without_requests(self, session, term_cli, term_assist):
-        """List --all shows sessions even without requests."""
+    def test_list_shows_sessions_without_requests(self, session, term_cli, term_assist):
+        """List shows sessions even without requests."""
         # Session exists but has no request
-        result = term_assist("list", "-a")
+        result = term_assist("list")
         assert result.ok
         assert session in result.stdout
         assert "no request" in result.stdout.lower()
 
-    def test_list_handles_no_pending_gracefully(self, session, term_cli, term_assist):
-        """List without pending requests shows appropriate message."""
-        # Session exists but has no request - list (without -a) should work
+    def test_list_shows_all_sessions(self, session, term_cli, term_assist):
+        """List always shows all sessions regardless of request state."""
         result = term_assist("list")
         assert result.ok
-        # Should either show "No pending requests" or just be empty of this session
-        # (other parallel tests might have sessions with requests)
+        # Session should appear even without a request
+        assert session in result.stdout
 
 
 class TestDone:
@@ -509,7 +507,7 @@ class TestAttachPreservesSize:
     def _get_window_size(self, tmux_socket: str, session: str) -> str:
         """Return 'WxH' for a session's first window."""
         res = subprocess.run(
-            ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", session,
+            ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", f"={session}:",
              "#{window_width}x#{window_height}"],
             capture_output=True, text=True,
         )
@@ -518,7 +516,7 @@ class TestAttachPreservesSize:
     def _session_has_client(self, tmux_socket: str, session: str) -> bool:
         """Check whether session has at least one attached client."""
         res = subprocess.run(
-            ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", session,
+            ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", f"={session}:",
              "#{session_attached}"],
             capture_output=True, text=True,
         )
@@ -606,3 +604,61 @@ class TestAttachPreservesSize:
             term_cli("send-key", "-s", helper, "d")
             term_cli("wait", "-s", helper, "-t", "5")
             term_cli("kill", "-s", helper, "-f")
+
+    def test_window_size_manual_survives_detach(
+        self, tmux_socket: str, session_factory, term_cli, term_assist,
+    ) -> None:
+        """window-size manual must persist after term-assist detach.
+
+        Regression test: the detach hook used to ``set-option -u window-size``
+        which removed the ``manual`` protection set by ``cmd_start``.  After
+        detach the session would inherit the global window-size policy
+        (typically ``latest``) and tmux would resize it to match the
+        attached client's terminal dimensions.
+        """
+        target = session_factory(cols=100, rows=30)
+        helper = unique_session_name()
+        term_cli("start", "-s", helper, "-x", "60", "-y", "15", check=True)
+        term_cli("wait", "-s", helper, "-t", "10", check=True)
+
+        # Verify window-size manual is set by cmd_start
+        res = subprocess.run(
+            ["tmux", "-L", tmux_socket, "show-option", "-qv", "-t", f"={target}:",
+             "window-size"],
+            capture_output=True, text=True,
+        )
+        assert res.stdout.strip() == "manual", \
+            "cmd_start should set window-size manual"
+
+        # Attach helper to target
+        term_assist_path = str(TERM_ASSIST)
+        term_cli(
+            "run", "-s", helper,
+            f"TMUX='' {sys.executable} {term_assist_path}"
+            f" -L {tmux_socket} attach -s {target}",
+        )
+
+        try:
+            assert retry_until(
+                lambda: self._session_has_client(tmux_socket, target),
+                timeout=5.0,
+            ), "term-assist attach did not register a client on target"
+        finally:
+            # Detach
+            term_cli("send-key", "-s", helper, "C-b")
+            term_cli("send-key", "-s", helper, "d")
+            term_cli("wait", "-s", helper, "-t", "5")
+            term_cli("kill", "-s", helper, "-f")
+
+        # After detach, window-size manual must still be set
+        res = subprocess.run(
+            ["tmux", "-L", tmux_socket, "show-option", "-qv", "-t", f"={target}:",
+             "window-size"],
+            capture_output=True, text=True,
+        )
+        assert res.stdout.strip() == "manual", \
+            "term-assist detach must not remove window-size manual"
+
+        # And the size must be unchanged
+        assert self._get_window_size(tmux_socket, target) == "100x30", \
+            "Session was resized after term-assist detach"

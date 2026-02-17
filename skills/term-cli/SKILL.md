@@ -124,6 +124,38 @@ term-cli request-cancel --session NAME
 
 If they detach with Ctrl+B d while a request is still pending, `request-wait` fails with exit code 4.
 
+### File Transfer (over SSH / any shell)
+
+Transfer files in-band through the terminal session — works over SSH, in containers, or any shell. No `scp`/`sftp` needed.
+
+```bash
+# Upload a local file to the remote session
+term-cli upload --session NAME local_file.txt remote_file.txt
+
+# Download a remote file to local
+term-cli download --session NAME remote_file.txt local_file.txt
+
+# Overwrite existing files (both commands refuse by default)
+term-cli upload --session NAME file.txt file.txt --force --timeout 30
+
+# Pipe support: upload from stdin (REMOTE_PATH required)
+cat config.json | term-cli upload --session NAME - /remote/config.json
+
+# Pipe support: download to stdout (status message goes to stderr)
+term-cli download --session NAME /remote/data.csv - | jq .
+```
+
+**Key behaviors:**
+- **Hash verification** — SHA-256 integrity check
+- **Gzip compression** — transfers are always gzip-compressed
+- **Pipe support** — use `-`, status/verbose output goes to stderr
+- **Requires Python 3 on the remote** — transfer deploys a Python helper; fails if `python3` is not available
+- **Prompt required** — session must be at a clean shell prompt; transfers fail (exit 2) if a command is running, a TUI is active, or there is partial input on the line
+- **Overwrite protection** — refuses without `--force`
+- **Fast Uplioads**
+- **Optimized Downloads** — starts fast mode, gracefully falls back to slower mode for nested ssh+tmux setups.
+- **Default timeout: 120s** — set with `--timeout`
+
 ### Other Commands
 
 ```bash
@@ -173,6 +205,17 @@ term-cli request --session remote --message "Please enter SSH password"
 term-cli request-wait --session remote && term-cli capture --session remote
 ```
 
+## Example: File Transfer over SSH
+
+```bash
+# Assumes passwordless login
+term-cli start --session remote && term-cli run --session remote "ssh user@host" --wait
+# Upload a config file
+term-cli upload --session remote ./nginx.conf /etc/nginx/nginx.conf
+# Download a log file
+term-cli download --session remote /var/log/app.log ./app.log
+```
+
 ## Tips
 
 - **Defaults are sane.** Plain `capture` (visible screen), `wait` (10s timeout), and `start` (80x24) work for most cases. Use `--tail` to focus on just the last few rows. Only add `--timeout` or `--scrollback` when the default isn't enough.
@@ -188,7 +231,7 @@ term-cli request-wait --session remote && term-cli capture --session remote
 - Capture before sending keys to verify screen state
 - **Unsure if a TUI is running?** `term-cli status --session NAME` shows `Screen: alternate` when a full-screen app (vim, htop, less) is active. Use `wait-idle` for alternate screen, `wait` for normal.
 - Default `request-wait` timeout is 5 minutes — usually no need to override
-- Locked sessions (exit code 5): agent can only `capture`, `status`, `wait-*`, `request*`, `list`, `scroll`, `pipe-log`, `unpipe`
+- Locked sessions (exit code 5): agent can only `capture`, `status`, `wait-*`, `request*`, `list`, `scroll`, `pipe-log`, `unpipe`. Commands `run`, `send-*`, `resize`, `kill`, `upload`, `download` are blocked
 
 ## Exit Codes
 

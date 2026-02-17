@@ -59,12 +59,14 @@ Quick reference:
   term-cli resize --session NAME [--cols N] [--rows N]
   term-cli pipe-log --session NAME FILE [--raw]
   term-cli unpipe --session NAME
+  term-cli upload --session NAME LOCAL_PATH [REMOTE_PATH] [--force] [--timeout SEC] [--verbose]
+  term-cli download --session NAME REMOTE_PATH [LOCAL_PATH] [--force] [--timeout SEC] [--verbose]
   term-cli kill --session NAME [--force]
   term-cli list
 
 Locked sessions (human controls, agent observes):
   When a session is locked, the agent can only use: capture, status, wait-*, request*, list, scroll, pipe-log, unpipe
-  Locked commands (run, send-*, kill, resize) return exit code 5.
+  Locked commands (run, send-*, kill, resize, upload, download) return exit code 5.
 
 Human assistance (request/response):
   term-cli request --session NAME --message "help needed"
@@ -82,11 +84,16 @@ Short flags: -s (session), -w (wait), -t (timeout/tail), -x (cols), -y (rows),
 from __future__ import annotations
 
 import argparse
+import base64
+import gzip
+import hashlib
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -119,6 +126,14 @@ TERM_CLI_DETACHED_OPT = "@term_cli_detached"
 # tmux user option to lock session (agent can only observe, not interact)
 TERM_CLI_LOCKED_OPT = "@term_cli_agent_locked"
 
+# tmux user option to remember download strategy per session
+TERM_CLI_DL_STRATEGY_OPT = "@term_cli_dl_strategy"
+# tmux user option to store how many lines the _enter_alt_echo_off command
+# occupies on the normal screen (computed from cursor_x + command length +
+# terminal width).  Used by _run_helper and _restore_terminal to erase
+# exactly the right number of lines when leaving alt-screen.
+TERM_CLI_ERASE_LINES_OPT = "@_tc_erase_lines"
+
 # Global tmux socket name (set via -L/--socket-name option)
 _tmux_socket: str | None = None
 
@@ -130,6 +145,11 @@ EXIT_TIMEOUT = 3          # Timeout waiting for condition
 EXIT_DETACHED = 4         # Human detached without completing request
 EXIT_LOCKED = 5           # Session is locked (agent read-only)
 EXIT_NOT_FOUND = 127      # FileNotFoundError - missing dependency
+
+# Transfer defaults
+DEFAULT_TRANSFER_TIMEOUT = 120.0
+MIN_TRANSFER_COLS = 40       # Minimum terminal width for file transfers
+PIPE_CHECKPOINT_LINES = 50   # Lines between integrity checkpoints in pipe-pane download
 
 
 class OperationTimeout(Exception):
@@ -186,8 +206,23 @@ def _run_tmux(args: list[str]) -> CmdResult:
     )
     return CmdResult(ok=(proc.returncode == 0), code=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
 
+def _exact(session: str) -> str:
+    """Format session name for exact tmux target matching.
+
+    tmux's ``-t`` flag resolves targets by trying, in order: session ID
+    (``$``-prefixed), exact name, **prefix match**, then glob.  The prefix
+    step means ``-t foo`` silently matches ``foobar`` when ``foo`` doesn't
+    exist.  Prefixing with ``=`` forces exact-name-only matching.
+
+    The trailing ``:`` makes this a valid target for both session-level
+    commands (``has-session``, ``set-option``) and pane/window-level
+    commands (``capture-pane``, ``send-keys``).  Without it, pane commands
+    fail with "can't find pane: =name".
+    """
+    return f"={session}:"
+
 def _session_exists(session: str) -> bool:
-    res = _run_tmux(["has-session", "-t", session])
+    res = _run_tmux(["has-session", "-t", _exact(session)])
     return res.ok
 
 def _require_session(session: str) -> None:
@@ -203,8 +238,6 @@ def _env_int(name: str) -> int | None:
     except ValueError:
         raise ValueError(f"Environment variable {name} must be an integer, got: {v!r}")
 
-def _shlex_quote(s: str) -> str:
-    return shlex.quote(s)
 
 def _size_defaults() -> tuple[int, int]:
     cols = _env_int("TERM_CLI_COLS")
@@ -222,7 +255,7 @@ def _trim_output(text: str) -> str:
 
 def _get_pane_dimensions(session: str) -> tuple[int, int]:
     """Get current pane width and height."""
-    res = _run_tmux(["display-message", "-p", "-t", session, "#{pane_width}\t#{pane_height}"])
+    res = _run_tmux(["display-message", "-p", "-t", _exact(session), "#{pane_width}\t#{pane_height}"])
     if not res.ok:
         return (DEFAULT_COLS, DEFAULT_ROWS)
     parts = res.stdout.strip().split('\t')
@@ -244,7 +277,7 @@ def _capture_screen(session: str, trim: bool = True, raw: bool = False,
                       (e.g., scrollback).
     """
     # -p prints to stdout, -J joins wrapped lines, -e includes escape sequences (colors)
-    tmux_args = ["capture-pane", "-p", "-t", session]
+    tmux_args = ["capture-pane", "-p", "-t", _exact(session)]
     if join_wrapped:
         tmux_args.insert(2, "-J")
     if raw:
@@ -259,7 +292,7 @@ def _capture_screen(session: str, trim: bool = True, raw: bool = False,
 
 def _get_cursor_position(session: str) -> tuple[int, int] | None:
     """Get cursor position (x, y) in the pane. Returns None on failure."""
-    res = _run_tmux(["display-message", "-t", session, "-p", "#{cursor_x}\t#{cursor_y}"])
+    res = _run_tmux(["display-message", "-t", _exact(session), "-p", "#{cursor_x}\t#{cursor_y}"])
     if not res.ok:
         return None
     try:
@@ -268,34 +301,37 @@ def _get_cursor_position(session: str) -> tuple[int, int] | None:
     except (ValueError, IndexError):
         return None
 
-def _cursor_at_prompt(line: str, cursor_x: int) -> bool:
-    """Check if cursor is positioned at a prompt on this line.
-    
-    Simple check based on cursor position:
-    1. Position cursor_x - 1: must be non-existent OR whitespace
-    2. Position cursor_x - 2: must be a prompt char ($%#>)]:)
-    
-    This ensures we match prompts like "$ ", "(lldb) ", ">>> " where the cursor
-    sits right after the prompt character and optional space.
+def _cursor_at_prompt(lines: list[str], cursor_x: int, cursor_y: int) -> bool:
+    """Check if the cursor is positioned at a shell prompt.
+
+    Looks for the pattern ``prompt_char + space + cursor`` on the cursor's
+    line.  Also handles the wrap edge-case: when the prompt character lands
+    at the last terminal column, the trailing space (and cursor) wrap to the
+    next physical line.  In that case the prompt char is the last character
+    of the *previous* line.
+
+    Matches prompts like ``"$ "``, ``"(lldb) "``, ``">>> "``.
     """
-    # Need cursor at least at position 2 for "prompt_char + space + cursor"
-    if cursor_x < 2:
+    if cursor_y >= len(lines):
         return False
-    
-    # Position cursor_x - 1: must not exist or be whitespace
-    if cursor_x - 1 < len(line):
-        char_left_1 = line[cursor_x - 1]
-        if char_left_1 not in ' \t':
-            return False  # Non-whitespace immediately left of cursor
-    
-    # Position cursor_x - 2: must be a prompt char
-    if cursor_x - 2 >= len(line):
-        return False  # Line too short
-    char_left_2 = line[cursor_x - 2]
-    if char_left_2 not in PROMPT_CHARS:
-        return False
-    
-    return True
+    cursor_line = lines[cursor_y]
+
+    # Normal case: "prompt_char + space + cursor" on the same line.
+    if cursor_x >= 2:
+        if cursor_x - 1 < len(cursor_line):
+            if cursor_line[cursor_x - 1] not in " \t":
+                return False  # non-whitespace immediately left of cursor
+        if cursor_x - 2 < len(cursor_line) and cursor_line[cursor_x - 2] in PROMPT_CHARS:
+            return True
+
+    # Wrap case: prompt char at the last column of the previous line,
+    # trailing space + cursor wrapped to x=0 or x=1 on this line.
+    if cursor_x <= 1 and cursor_y > 0:
+        prev_line = lines[cursor_y - 1]
+        if prev_line and prev_line[-1] in PROMPT_CHARS:
+            return True
+
+    return False
 
 
 def _check_stability(session: str) -> bool:
@@ -341,13 +377,7 @@ def _is_at_prompt(session: str) -> bool:
     
     lines = screen.split('\n')
     
-    # Get the line where cursor is located
-    if cursor_y >= len(lines):
-        return False
-    cursor_line = lines[cursor_y]
-    
-    # Check if cursor is at a prompt on this line
-    if not _cursor_at_prompt(cursor_line, cursor_x):
+    if not _cursor_at_prompt(lines, cursor_x, cursor_y):
         return False
     
     # Stability check: screen must remain unchanged across multiple samples
@@ -400,6 +430,1062 @@ def _wait_for_idle(session: str, idle_seconds: float, timeout: float) -> tuple[b
         # Increase poll interval gradually to reduce CPU usage during long waits
         if poll_interval < POLL_INTERVAL_MAX:
             poll_interval = min(poll_interval * POLL_INTERVAL_MULTIPLIER, POLL_INTERVAL_MAX)
+
+
+def _wait_for_text(session: str, text: str, timeout: float) -> tuple[bool, float]:
+    """Wait for *text* to appear on the visible screen. Returns (success, elapsed_time).
+
+    Uses the same adaptive polling pattern as ``_wait_for_prompt``.
+    The search is a plain substring match on the captured screen content
+    (ANSI-stripped, trimmed).
+    """
+    start = time.time()
+    poll_interval = POLL_INTERVAL_INITIAL
+
+    while True:
+        screen = _capture_screen(session, trim=True, join_wrapped=True)
+        if text in screen:
+            return (True, time.time() - start)
+        if time.time() - start >= timeout:
+            return (False, time.time() - start)
+        time.sleep(poll_interval)
+        if poll_interval < POLL_INTERVAL_MAX:
+            poll_interval = min(poll_interval * POLL_INTERVAL_MULTIPLIER, POLL_INTERVAL_MAX)
+
+
+def _wait_for_any_text(
+    session: str, texts: list[str], timeout: float,
+) -> tuple[str | None, float]:
+    """Wait for any of *texts* to appear on screen.
+
+    Returns ``(matched_text, elapsed)`` where *matched_text* is the first
+    element of *texts* found on screen, or ``None`` on timeout.
+    """
+    start = time.time()
+    poll_interval = POLL_INTERVAL_INITIAL
+
+    while True:
+        screen = _capture_screen(session, trim=True, join_wrapped=True)
+        for t in texts:
+            if t in screen:
+                return (t, time.time() - start)
+        if time.time() - start >= timeout:
+            return (None, time.time() - start)
+        time.sleep(poll_interval)
+        if poll_interval < POLL_INTERVAL_MAX:
+            poll_interval = min(poll_interval * POLL_INTERVAL_MULTIPLIER, POLL_INTERVAL_MAX)
+
+
+# ----------------------------
+# Transfer utilities
+# ----------------------------
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\].*?(?:\x1b\\|\x07)")
+
+_B64_LINE_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from *text*."""
+    return _ANSI_RE.sub("", text)
+
+
+def _format_size(nbytes: int) -> str:
+    """Human-readable file size."""
+    if nbytes < 1024:
+        return f"{nbytes}B"
+    if nbytes < 1024 * 1024:
+        return f"{nbytes / 1024:.1f}KB"
+    return f"{nbytes / (1024 * 1024):.1f}MB"
+
+
+# -- Python remote helper script --
+# Delivered to the remote via stdin to ``python3 -``.  Runs entirely in
+# the terminal's alternate screen buffer so no transfer noise is visible.
+# Uses only Python stdlib — no external dependencies.
+#
+# Protocol markers (printed to stdout, read by term-cli via screen capture):
+#   TC_READY            upload: receiver is ready for base64 payload
+#   TC_NOWRITE          upload: destination is not writable
+#   TC_DONE <sha256>    upload/download: operation completed, sha256 hex digest
+#   TC_DL_BEGIN         download (pipe-pane): base64 output starts
+#   TC_DL_END           download (pipe-pane): base64 output ends
+#   TC_CHK <n> <b>      download (pipe-pane): checkpoint (line count, byte count)
+#   TC_C <idx> / TC_E <idx>  download (chunked): chunk start/end with index
+#   TC_ERR <message>    any: error occurred
+
+_REMOTE_HELPER = r'''
+import sys, os, base64, gzip, hashlib, termios, tty
+
+_in_alt = False
+
+def _enter_alt():
+    global _in_alt
+    sys.stdout.write('\033[?1049h')
+    sys.stdout.flush()
+    _in_alt = True
+
+def _leave_alt():
+    global _in_alt
+    if _in_alt:
+        sys.stdout.write('\033[?1049l')
+        sys.stdout.flush()
+        _in_alt = False
+
+def _wait_for_dismiss():
+    """Block on alt-screen until the host (or a human) sends a dismiss key.
+
+    Accepted keys: q, Q, Ctrl-C (\\x03), Escape (\\x1b).
+    This keeps markers (TC_DONE, TC_ERR, etc.) visible on the alt-screen
+    so the host can reliably detect them before dismissing.
+    """
+    if not _in_alt:
+        return
+    fd = os.open('/dev/tty', os.O_RDONLY)
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = os.read(fd, 1)
+            if not ch or ch in (b'q', b'Q', b'\x03', b'\x1b'):
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.close(fd)
+
+def _die(msg):
+    if not _in_alt:
+        _enter_alt()
+    sys.stdout.write('TC_ERR ' + msg + '\n')
+    sys.stdout.flush()
+    _wait_for_dismiss()
+    _leave_alt()
+    sys.exit(1)
+
+def _read_tty_bytes(n):
+    """Read exactly *n* bytes from /dev/tty in raw mode."""
+    fd = os.open('/dev/tty', os.O_RDONLY)
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = os.read(fd, min(n - len(buf), 65536))
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.close(fd)
+    return bytes(buf)
+
+def cmd_upload(dest, b64_len):
+    """Receive base64 payload via /dev/tty, decode, decompress, write to dest."""
+    _enter_alt()
+    # Track whether the file existed before so we only clean up our own mess
+    existed = os.path.exists(dest)
+    # Trial write — fail before signalling ready
+    try:
+        with open(dest, 'ab') as f:
+            pass
+    except (OSError, IOError):
+        sys.stdout.write('TC_NOWRITE\n')
+        sys.stdout.flush()
+        _wait_for_dismiss()
+        return
+
+    def _cleanup():
+        if not existed:
+            try:
+                os.unlink(dest)
+            except OSError:
+                pass
+
+    sys.stdout.write('TC_READY\n')
+    sys.stdout.flush()
+
+    raw_b64 = _read_tty_bytes(b64_len)
+
+    if len(raw_b64) != b64_len:
+        _cleanup()
+        _die('incomplete payload: expected %d got %d' % (b64_len, len(raw_b64)))
+
+    try:
+        decoded = base64.b64decode(raw_b64)
+    except Exception as e:
+        _cleanup()
+        _die('base64 decode failed: ' + str(e))
+
+    try:
+        decoded = gzip.decompress(decoded)
+    except Exception as e:
+        _cleanup()
+        _die('gzip decompress failed: ' + str(e))
+
+    try:
+        tmp_dest = dest + '.term-cli.tmp'
+        with open(tmp_dest, 'wb') as f:
+            f.write(decoded)
+        os.rename(tmp_dest, dest)
+    except (OSError, IOError) as e:
+        # Clean up temp file if rename failed
+        try:
+            os.unlink(tmp_dest)
+        except OSError:
+            pass
+        _cleanup()
+        _die('write failed: ' + str(e))
+
+    sha = hashlib.sha256(decoded).hexdigest()
+    sys.stdout.write('TC_DONE ' + sha + '\n')
+    sys.stdout.flush()
+    _wait_for_dismiss()
+
+def cmd_download_pipe(src, checkpoint_lines):
+    """Download via stdout (for pipe-pane capture).  Outputs framed base64."""
+    _enter_alt()
+    try:
+        data = open(src, 'rb').read()
+    except (OSError, IOError) as e:
+        _die('read failed: ' + str(e))
+
+    sha = hashlib.sha256(data).hexdigest()
+
+    data = gzip.compress(data, compresslevel=6)
+
+    b64 = base64.encodebytes(data).decode('ascii')
+    # Normalise to 76-char lines (base64.encodebytes uses 76 already, but be safe)
+    raw_lines = []
+    for line in b64.splitlines():
+        line = line.strip()
+        if line:
+            raw_lines.append(line)
+    # Re-wrap to exactly 76 chars per line
+    joined = ''.join(raw_lines)
+    lines = [joined[i:i+76] for i in range(0, len(joined), 76)]
+
+    sys.stdout.write('TC_DL_BEGIN\n')
+    n = checkpoint_lines
+    line_count = 0
+    byte_count = 0
+    for line in lines:
+        sys.stdout.write(line + '\n')
+        line_count += 1
+        byte_count += len(line)
+        if line_count % n == 0:
+            sys.stdout.write('TC_CHK %d %d\n' % (line_count, byte_count))
+    sys.stdout.write('TC_CHK %d %d\n' % (line_count, byte_count))
+    sys.stdout.write('TC_DL_END\n')
+    sys.stdout.write('TC_DONE ' + sha + '\n')
+    sys.stdout.flush()
+
+def _wait_for_ack():
+    """Block until the host sends an ack key (n/N) or dismiss (q/Q/Ctrl-C/Esc).
+
+    Returns True for ack (continue), False for dismiss (stop).
+    """
+    fd = os.open('/dev/tty', os.O_RDONLY)
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = os.read(fd, 1)
+            if not ch or ch in (b'q', b'Q', b'\x03', b'\x1b'):
+                return False
+            if ch in (b'n', b'N'):
+                return True
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.close(fd)
+
+def cmd_download_chunked(src, chunk_size):
+    """Download via chunked screen capture with ack protocol.
+
+    Stays on alt-screen throughout.  Writes TC_DL_INFO, then iterates
+    chunks with TC_C/TC_E delimiters, waiting for ack between each.
+    Uses dismiss pattern at the end.
+    """
+    _enter_alt()
+    try:
+        raw_data = open(src, 'rb').read()
+    except (OSError, IOError) as e:
+        _die('read failed: ' + str(e))
+
+    sha = hashlib.sha256(raw_data).hexdigest()
+
+    data = gzip.compress(raw_data, compresslevel=6)
+
+    b64 = base64.encodebytes(data).decode('ascii')
+    raw_lines = []
+    for line in b64.splitlines():
+        line = line.strip()
+        if line:
+            raw_lines.append(line)
+    joined = ''.join(raw_lines)
+    lines = [joined[i:i+76] for i in range(0, len(joined), 76)]
+    total_lines = len(lines)
+
+    # Report info and wait for ack to start chunking
+    sys.stdout.write('\033[2J\033[H')
+    sys.stdout.write('TC_DL_INFO %d %s\n' % (total_lines, sha))
+    sys.stdout.flush()
+    if not _wait_for_ack():
+        return
+
+    offset = 0
+    chunk_idx = 0
+    while offset < total_lines:
+        count = min(chunk_size, total_lines - offset)
+        chunk = lines[offset:offset+count]
+        sys.stdout.write('\033[2J\033[H')
+        sys.stdout.write('TC_C %d\n' % chunk_idx)
+        for line in chunk:
+            sys.stdout.write(line + '\n')
+        sys.stdout.write('TC_E %d\n' % chunk_idx)
+        sys.stdout.flush()
+        offset += count
+        chunk_idx += 1
+        if offset < total_lines:
+            if not _wait_for_ack():
+                return
+        # After last chunk, fall through to TC_DONE
+
+    sys.stdout.write('TC_DONE ' + sha + '\n')
+    sys.stdout.flush()
+    _wait_for_dismiss()
+
+if __name__ == '__main__':
+    args = sys.argv[1:]
+    if not args:
+        _die('usage: upload|download_pipe|download_chunked ...')
+
+    cmd = args[0]
+    try:
+        if cmd == 'upload':
+            # upload <dest> <b64_len>
+            dest = args[1]
+            b64_len = int(args[2])
+            cmd_upload(dest, b64_len)
+        elif cmd == 'download_pipe':
+            # download_pipe <src> <checkpoint_lines>
+            src = args[1]
+            cp = int(args[2])
+            cmd_download_pipe(src, cp)
+        elif cmd == 'download_chunked':
+            # download_chunked <src> <chunk_size>
+            src = args[1]
+            chunk_size = int(args[2])
+            cmd_download_chunked(src, chunk_size)
+        else:
+            _die('unknown command: ' + cmd)
+    except SystemExit:
+        raise
+    except Exception as e:
+        _die(str(e))
+    finally:
+        _leave_alt()
+'''.lstrip()
+
+# Pre-computed compressed + base64 encoding of _REMOTE_HELPER.
+# Used by _run_helper() to deliver the script in a single shell command
+# via ``python3 -c 'exec(gzip.decompress(base64.b64decode("...")).decode())'``.
+_REMOTE_HELPER_B64: str = base64.b64encode(
+    gzip.compress(_REMOTE_HELPER.encode(), compresslevel=9)
+).decode()
+
+
+def _load_and_paste(session: str, data: str, *, bracketed: bool = False) -> None:
+    """Load data into tmux paste buffer, then paste into session pane.
+
+    Uses tmux load-buffer + paste-buffer (same mechanism as send-stdin).
+
+    When *bracketed* is True, uses ``paste-buffer -p`` which wraps the
+    pasted content in bracketed-paste escape sequences (``\\e[200~`` /
+    ``\\e[201~``).  Modern shells (zsh, bash 4.4+, fish) recognise these
+    and treat the entire paste as a single input block — no line-editor
+    wrapping or continuation prompts — which is essential for pasting the
+    ~2.5 KB bootstrap command on narrow (80-column) terminals.
+
+    Bracketed paste must **not** be used when pasting raw data into a
+    program that reads from ``/dev/tty`` in raw mode (e.g. the upload
+    helper), because the escape-sequence wrapper bytes would corrupt the
+    payload.
+    """
+    tmux = _tmux_path()
+    tmux_args = [tmux]
+    if _tmux_socket:
+        tmux_args.extend(["-L", _tmux_socket])
+    tmux_args.extend(["load-buffer", "-"])
+    proc = subprocess.run(
+        tmux_args,
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "Failed to load buffer")
+
+    paste_cmd: list[str] = ["paste-buffer"]
+    if bracketed:
+        paste_cmd.append("-p")
+    paste_cmd.extend(["-t", _exact(session)])
+    res = _run_tmux(paste_cmd)
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to paste buffer")
+
+    _run_tmux(["delete-buffer"])
+
+
+def _send_cmd(session: str, cmd: str) -> None:
+    """Send a command string + Enter to the session pane.
+
+    A leading space is prepended so that shells with HISTCONTROL=ignorespace
+    (the common default) do not record transfer-internal commands in history.
+    """
+    res = _run_tmux(["send-keys", "-t", _exact(session), "--", " " + cmd])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to send command")
+    res2 = _run_tmux(["send-keys", "-t", _exact(session), "Enter"])
+    if not res2.ok:
+        raise RuntimeError(res2.stderr.strip() or "Failed to send Enter")
+
+
+def _remote_exec(session: str, cmd: str, timeout: float) -> str:
+    """Run *cmd* in session, wait for prompt, return captured screen text.
+
+    The caller is responsible for ensuring the session is at a prompt before
+    calling this function.  On timeout, raises OperationTimeout.
+    """
+    _send_cmd(session, cmd)
+    time.sleep(0.1)
+    success, _ = _wait_for_prompt(session, timeout)
+    if not success:
+        raise OperationTimeout(f"remote command did not complete within {timeout}s: {cmd}")
+    return _capture_screen(session, trim=True, join_wrapped=True)
+
+
+def _dismiss_helper(session: str) -> None:
+    """Send 'q' to dismiss a remote helper blocking on _wait_for_dismiss().
+
+    After the helper receives 'q', it leaves alt-screen and exits, allowing
+    the shell prompt to return.  A short sleep gives it time to process.
+    """
+    _run_tmux(["send-keys", "-t", _exact(session), "q"])
+    time.sleep(0.3)
+
+
+def _get_erase_lines(session: str) -> int:
+    """Read the stored erase-line count from the tmux session option.
+
+    Returns the number of physical lines that the ``_enter_alt_echo_off``
+    command occupied on the normal screen.  Falls back to 1 if the option
+    is missing (defensive).
+    """
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_ERASE_LINES_OPT])
+    if res.ok and res.stdout.strip():
+        try:
+            return max(1, int(res.stdout.strip()))
+        except ValueError:
+            pass
+    return 1
+
+
+def _build_erase_seq(n: int) -> str:
+    r"""Build an escape sequence that exits alt-screen and erases *n* lines.
+
+    After ``\033[?1049l`` restores the normal screen, the cursor is on the
+    line immediately below the echoed command text (bash echoed the command +
+    newline, then executed the pipeline which entered alt-screen).
+
+    The sequence:
+    1. ``\033[?1049l`` — leave alt-screen, restore normal screen + cursor.
+    2. ``\033[2K`` — erase the current line (the blank line after the
+       echoed command).
+    3. (``\033[A\033[2K``) × *n* — move up and erase each line of the
+       echoed command text.
+    4. ``\033[G`` — move cursor to column 1.
+    """
+    seq = r"\033[?1049l\033[2K"
+    seq += r"\033[A\033[2K" * n
+    seq += r"\033[G"
+    return seq
+
+
+def _restore_terminal(session: str) -> None:
+    """Best-effort: interrupt running process, exit alternate screen, restore echo.
+
+    Called in except/finally blocks to ensure the terminal is usable after a
+    failed or interrupted transfer.
+
+    If the helper was already dismissed cleanly (the bootstrap suffix restored
+    echo and HISTCONTROL, and we're back on normal screen at a prompt), this
+    function detects that and skips sending any commands — avoiding visible
+    cleanup artifacts and cursor corruption on the normal screen.
+
+    When cleanup IS needed (helper crashed, timeout, still on alt-screen):
+
+    Order matters:
+    1. Interrupt first (C-c twice) — kills any running helper that may be
+       reading from /dev/tty.  If we sent shell commands *before* C-c,
+       the running helper would consume them as payload data.
+    2. Clear line editor (kill any partially-typed command).
+    3. Single combined command: exit alt-screen (with cursor-up + erase to
+       clean the echoed setup command), restore echo and HISTCONTROL.
+    """
+    try:
+        # Check if cleanup is needed: if we're on normal screen and at a
+        # prompt, the helper exited cleanly and the bootstrap suffix already
+        # restored everything.
+        res = _run_tmux(
+            ["display-message", "-t", _exact(session), "-p", "#{alternate_on}"]
+        )
+        on_alt = res.ok and res.stdout.strip() == "1"
+
+        if not on_alt and _is_at_prompt(session):
+            # Terminal is already clean — nothing to do.
+            return
+
+        # 1. Interrupt twice (handles nested processes)
+        _run_tmux(["send-keys", "-t", _exact(session), "C-c"])
+        time.sleep(0.1)
+        _run_tmux(["send-keys", "-t", _exact(session), "C-c"])
+        time.sleep(0.2)
+        # 2. Clear line editor (kill any partially-typed command)
+        _run_tmux(["send-keys", "-t", _exact(session), "C-u"])
+        time.sleep(0.05)
+        # 3. Combined cleanup in a single command (= single Enter = single prompt).
+        # - Exit alt-screen, erase exactly the lines the setup command
+        #   occupied (computed by _enter_alt_echo_off, stored in tmux opt).
+        # - Restore echo and restore original HISTCONTROL value.
+        # The alt-screen exit is a no-op if already on normal screen.
+        erase_n = _get_erase_lines(session)
+        erase_seq = _build_erase_seq(erase_n)
+        _send_cmd(
+            session,
+            f"printf '{erase_seq}'; stty echo 2>/dev/null; HISTCONTROL=\"${{_TCH-}}\"; unset _TCH 2>/dev/null",
+        )
+        # Don't wait long — this is best-effort cleanup
+        _wait_for_prompt(session, 3.0)
+    except Exception:
+        pass  # Best-effort — never mask the original exception
+
+
+def _require_prompt_ready(session: str) -> None:
+    """Verify the session is at a clean shell prompt, ready for transfer commands.
+
+    Raises ValueError if the shell is not at a prompt (a command is running,
+    a TUI is active, or there's partial input on the command line).
+
+    Note: we intentionally do NOT check ``#{alternate_on}`` because nested
+    tmux sessions legitimately report alt-screen even when the inner shell
+    is idle at a prompt.  The prompt-detection heuristic handles TUIs
+    correctly — when a TUI (vim, htop, less) is in the foreground, the
+    cursor won't be at a recognisable prompt.
+    """
+    if not _is_at_prompt(session):
+        raise ValueError(
+            "Session shell is not at a prompt — a command may be running, "
+            "a TUI may be active, or there is partial input on the command line. "
+            "Wait for the command to finish or clear any partial input (Ctrl-C) "
+            "before attempting file transfers."
+        )
+
+
+def _enter_alt_echo_off(session: str) -> None:
+    """Save HISTCONTROL, enable ignorespace, disable echo, enter alt-screen.
+
+    Sends a single combined command that:
+    1. Saves the original ``HISTCONTROL`` value in ``_TCH``.
+    2. Sets ``HISTCONTROL=ignorespace`` so subsequent commands prefixed
+       with a space (which ``_send_cmd`` always does) are not recorded.
+    3. Disables echo (``stty -echo``).
+    4. Enters alternate screen (``printf '\\033[?1049h'``).
+
+    Before sending the command, queries the cursor position and terminal
+    width to compute how many physical lines the echoed command text will
+    occupy.  This count is stored in a tmux session option so that
+    ``_run_helper`` and ``_restore_terminal`` can erase exactly the right
+    number of lines when leaving alt-screen.
+
+    This combined command is itself recorded in history (``HISTCONTROL``
+    hasn't taken effect yet when bash reads it), but it's a short setup
+    line.  All subsequent commands — probes, the python3 bootstrap
+    one-liner — are suppressed because ``_send_cmd`` prepends a space.
+
+    The original ``HISTCONTROL`` value is restored by the bootstrap's
+    suffix or by ``_restore_terminal()`` on error paths.
+
+    The echoed command text on the normal screen is cleaned up later by
+    ``_run_helper``'s bootstrap prefix (cursor-up + erase).
+    """
+    cmd = r"""_TCH="${HISTCONTROL-}"; HISTCONTROL=ignorespace; stty -echo; printf '\033[?1049h'"""
+
+    # Compute how many physical lines the echoed command will occupy.
+    # _send_cmd prepends a space, so the echoed text is " " + cmd.
+    # The shell echoes this starting at cursor_x (the prompt width).
+    cursor_pos = _get_cursor_position(session)
+    pane_w, _ = _get_pane_dimensions(session)
+    cursor_x = cursor_pos[0] if cursor_pos else 0
+    visible_chars = cursor_x + 1 + len(cmd)  # prompt + space + cmd
+    erase_lines = (visible_chars + pane_w - 1) // pane_w
+
+    # Store for _run_helper / _restore_terminal to use.
+    _run_tmux([
+        "set-option", "-t", _exact(session),
+        TERM_CLI_ERASE_LINES_OPT, str(erase_lines),
+    ])
+
+    _send_cmd(session, cmd)
+    ok, _ = _wait_for_prompt(session, 5.0)
+    if not ok:
+        raise RuntimeError(
+            "Timed out waiting for alt-screen prompt after stty -echo"
+        )
+
+
+def _hide_probe_start(session: str) -> None:
+    """Disable echo/history and enter alt-screen so probes run invisibly.
+
+    Probes (``_probe_python``, ``_remote_file_exists``) run on the
+    alt-screen so their output is invisible on the normal screen.
+
+    The shell echoes the setup command onto the normal screen (on the
+    current prompt line) before executing it, so the saved normal-screen
+    snapshot contains that text.  This is cleaned up later by
+    ``_run_helper(already_on_alt=True)`` which, upon leaving alt-screen,
+    erases exactly the lines the echoed command occupied (computed
+    dynamically from prompt width and terminal width).
+
+    ``_restore_terminal()`` handles cleanup on crash (exits alt-screen,
+    restores echo, restores HISTCONTROL).
+    """
+    _enter_alt_echo_off(session)
+
+
+def _probe_python(session: str, timeout: float) -> str:
+    """Detect whether ``python3`` or ``python`` is available on the remote.
+
+    Returns the binary name (``"python3"`` or ``"python"``).
+    Raises RuntimeError if neither is found.
+    """
+    cmd = (
+        "python3 -c \"import sys; print('TC_PY3_%d.%d' % sys.version_info[:2])\" 2>/dev/null; "
+        "python -c \"import sys; print('TC_PYBIN_%d.%d' % sys.version_info[:2])\" 2>/dev/null; "
+        "printf 'TC_PY_DONE\\n'"
+    )
+    screen = _remote_exec(session, cmd, timeout)
+    lines = [ln.strip() for ln in screen.splitlines()]
+    for ln in lines:
+        if ln.startswith("TC_PY3_"):
+            return "python3"
+    for ln in lines:
+        if ln.startswith("TC_PYBIN_"):
+            # Only accept Python 3.x running as 'python'
+            if ln.startswith("TC_PYBIN_3."):
+                return "python"
+    raise RuntimeError(
+        "Python 3 is not available on the remote host.  "
+        "Install python3 to enable file transfers."
+    )
+
+
+def _run_helper(
+    session: str,
+    python_bin: str,
+    helper_args: str,
+    already_on_alt: bool = False,
+) -> None:
+    """Deploy and execute the Python remote helper in the terminal.
+
+    The helper script is delivered as a single shell command using a
+    compressed + base64-encoded payload (~2.4 KB) executed via
+    ``python3 -c 'exec(gzip.decompress(base64.b64decode("...")).decode())'``.
+
+    This avoids the heredoc/paste approach entirely — no multi-line paste,
+    no tmux buffer size issues, no tty-vs-pipe stdin complications.
+
+    The helper script itself manages alternate-screen enter/exit internally
+    (``_enter_alt()`` / ``_leave_alt()``).  If the helper crashes before
+    entering alt-screen, ``_restore_terminal()`` handles cleanup.
+
+    The terminal is always on alt-screen (with echo off) when the bootstrap
+    is pasted — either because the caller already set this up via
+    ``_hide_probe_start`` (*already_on_alt=True*) or because this function
+    does it itself.
+
+    The bootstrap is prefixed with a ``printf`` that leaves alt-screen,
+    erases exactly the lines the echoed setup command occupied (computed
+    by ``_enter_alt_echo_off`` and stored in a tmux session option), and
+    moves the cursor to column 1.  The helper's ``_enter_alt()``
+    then saves the cleaned normal screen.  Because alt-exit and alt-enter
+    happen within the same shell command, no PS1 is printed on the restored
+    screen.
+    """
+    if not already_on_alt:
+        # Enter alt-screen with echo off and history disabled,
+        # same as _hide_probe_start.
+        # This ensures the bootstrap paste and its echo are invisible,
+        # and the alt-exit prefix in the bootstrap can erase the echoed
+        # command line (the set/stty/printf text).
+        _enter_alt_echo_off(session)
+
+    # Send the single-line bootstrap command via paste buffer.
+    # The command is ~2.5KB, which exceeds typical 80-column terminals.
+    # Using send-keys would cause the shell's line editor to wrap the text,
+    # inserting continuation prompts into the command and corrupting it.
+    # Paste-buffer injects text directly into the terminal input, bypassing
+    # the line editor's wrapping logic.
+    # The helper args (upload/download/etc.) are passed as regular shell args
+    # to python3, which populates sys.argv = ['-c', 'upload', ...].
+    # The helper reads sys.argv[1:] for its command dispatch.
+
+    # We're on alt-screen.  Prepend a printf that leaves alt-screen to
+    # restore the normal screen, erases the echoed commands, and moves
+    # the cursor to column 1.
+    #
+    # The erase count was computed by _enter_alt_echo_off based on the
+    # actual cursor position (prompt width) and terminal width, so it
+    # erases exactly the lines occupied by the echoed command — no more.
+    erase_n = _get_erase_lines(session)
+    erase_seq = _build_erase_seq(erase_n)
+    alt_exit = f"printf '{erase_seq}'; "
+    bootstrap = (
+        f" {alt_exit}{python_bin} -c "
+        f"'import base64,gzip;exec(gzip.decompress(base64.b64decode("
+        f'"{_REMOTE_HELPER_B64}"'
+        f")).decode())' "
+        f"{helper_args} || true; "
+        f'stty echo; HISTCONTROL="${{_TCH-}}"; unset _TCH'
+    )
+    _load_and_paste(session, bootstrap, bracketed=True)
+    _run_tmux(["send-keys", "-t", _exact(session), "Enter"])
+
+
+def _remote_file_exists(session: str, path: str, timeout: float) -> bool:
+    """Check if a file exists in the session's shell.
+
+    Uses ``test -f`` with a unique per-invocation marker to avoid false
+    positives from stale output still visible on the terminal screen.
+    """
+    marker = f"TC_FE_{os.getpid()}_{int(time.time() * 1000) & 0xFFFFFF}"
+    cmd = f"test -f {shlex.quote(path)}; printf '{marker}_%d\\n' \"$?\""
+    screen = _remote_exec(session, cmd, timeout)
+    return f"{marker}_0" in screen
+
+
+def _get_dl_strategy(session: str) -> str | None:
+    """Read remembered download strategy for this session."""
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_DL_STRATEGY_OPT])
+    if res.ok and res.stdout.strip():
+        return res.stdout.strip()
+    return None
+
+
+def _set_dl_strategy(session: str, strategy: str) -> None:
+    """Remember download strategy for this session."""
+    _run_tmux(["set-option", "-t", _exact(session), TERM_CLI_DL_STRATEGY_OPT, strategy])
+
+
+def _download_pipe(
+    session: str,
+    remote_path: str,
+    local_tmp: str,
+    python_bin: str,
+    timeout: float,
+    verbose: bool,
+    already_on_alt: bool = False,
+) -> tuple[bytes, str] | None:
+    """Download via pipe-pane (fast path). Returns (decoded_bytes, sha256) or None.
+
+    Deploys the Python remote helper with ``download_pipe`` command.  The
+    helper outputs TC_DL_BEGIN, base64 lines with TC_CHK checkpoints,
+    TC_DL_END, and TC_DONE <sha256>.  pipe-pane captures the raw PTY
+    stream (works even though the helper runs in alt-screen).
+
+    Data is always gzip-compressed during transfer.
+
+    Returns None on corruption so the caller can fall back to chunked.
+    """
+    remote_quoted = shlex.quote(remote_path)
+
+    # Ensure no existing pipe
+    _run_tmux(["pipe-pane", "-t", _exact(session)])
+    time.sleep(0.05)
+
+    # Start pipe-pane writing to local temp file
+    shell_cmd = f"cat > {shlex.quote(local_tmp)}"
+    res = _run_tmux(["pipe-pane", "-O", "-o", "-t", _exact(session), shell_cmd])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to start pipe-pane")
+
+    try:
+        # Deploy Python helper with download_pipe command
+        helper_args = f"download_pipe {remote_quoted} {PIPE_CHECKPOINT_LINES}"
+        _run_helper(session, python_bin, helper_args, already_on_alt=already_on_alt)
+
+        # Wait for prompt to return (helper finished, alt-screen exited)
+        time.sleep(0.2)
+        success, _ = _wait_for_prompt(session, timeout)
+        if not success:
+            raise OperationTimeout(f"download (pipe) did not complete within {timeout}s")
+    finally:
+        # Always stop pipe-pane
+        _run_tmux(["pipe-pane", "-t", _exact(session)])
+        time.sleep(0.1)
+
+    # Read captured output
+    try:
+        with open(local_tmp, "r") as f:
+            raw = f.read()
+    finally:
+        try:
+            os.unlink(local_tmp)
+        except OSError:
+            pass
+
+    # Strip ANSI escapes that may leak from the terminal
+    raw = _strip_ansi(raw)
+
+    # Parse between delimiters
+    begin_idx = raw.find("TC_DL_BEGIN\n")
+    end_idx = raw.find("TC_DL_END\n")
+    if begin_idx < 0 or end_idx < 0 or end_idx <= begin_idx:
+        if verbose:
+            _eprint("pipe-pane: delimiters not found, falling back")
+        return None
+
+    payload = raw[begin_idx + len("TC_DL_BEGIN\n"):end_idx]
+
+    # Extract TC_DONE sha256 from after TC_DL_END
+    remote_sha: str | None = None
+    after_end = raw[end_idx:]
+    for line in after_end.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("TC_DONE "):
+            parts = stripped.split()
+            if len(parts) >= 2:
+                remote_sha = parts[1]
+            break
+
+    # Check for TC_ERR
+    if "TC_ERR " in raw:
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("TC_ERR "):
+                if verbose:
+                    _eprint(f"pipe-pane: remote error: {stripped[7:]}")
+                return None
+
+    # Valid base64 chars (lines are [A-Za-z0-9+/=]+), checkpoint lines
+    # start with "TC_CHK ".  Anything else is noise.
+
+    # Validate checkpoints and extract data lines
+    data_lines: list[str] = []
+    cumulative_bytes = 0
+    line_count = 0
+    for line in payload.splitlines():
+        if line.startswith("TC_CHK "):
+            parts = line.split()
+            if len(parts) != 3:
+                if verbose:
+                    _eprint(f"pipe-pane: malformed checkpoint: {line}")
+                return None
+            try:
+                expected_lines = int(parts[1])
+                expected_bytes = int(parts[2])
+            except ValueError:
+                if verbose:
+                    _eprint(f"pipe-pane: bad checkpoint values: {line}")
+                return None
+            if expected_lines != line_count or expected_bytes != cumulative_bytes:
+                if verbose:
+                    _eprint(
+                        f"pipe-pane: checkpoint mismatch at line {line_count}: "
+                        f"expected ({expected_lines}, {expected_bytes}), "
+                        f"got ({line_count}, {cumulative_bytes})"
+                    )
+                return None
+        elif _B64_LINE_RE.match(line):
+            data_lines.append(line)
+            line_count += 1
+            cumulative_bytes += len(line)
+        # else: noise line — skip silently
+
+    b64_data = "\n".join(data_lines)
+    try:
+        decoded = base64.b64decode(b64_data)
+    except Exception:
+        if verbose:
+            _eprint("pipe-pane: base64 decode failed, falling back")
+        return None
+
+    try:
+        decoded = gzip.decompress(decoded)
+    except Exception:
+        if verbose:
+            _eprint("pipe-pane: gzip decompress failed, falling back")
+        return None
+
+    # Use remote_sha if available, otherwise return empty string
+    return (decoded, remote_sha or "")
+
+
+def _download_chunked(
+    session: str,
+    remote_path: str,
+    python_bin: str,
+    timeout: float,
+    verbose: bool,
+    already_on_alt: bool = False,
+) -> tuple[bytes, str]:
+    """Download via chunked screen capture (safe fallback).
+
+    Deploys a single long-running helper that stays on alt-screen throughout.
+    The helper reports TC_DL_INFO (total lines + sha256), then iterates
+    chunks delimited by TC_C/TC_E, waiting for an ack key ('n') between
+    each.  After the last chunk it writes TC_DONE and waits for dismiss
+    ('q').
+
+    Data is always gzip-compressed during transfer.
+
+    Returns (decoded_bytes, sha256_hex).
+    """
+    remote_quoted = shlex.quote(remote_path)
+
+    # Determine chunk size based on terminal height.
+    _, pane_height = _get_pane_dimensions(session)
+    # Leave margin for TC_C, TC_E, and cursor positioning.
+    usable_lines = max(pane_height - 6, 4)
+
+    # Deploy helper — single invocation for the entire chunked download.
+    helper_args = f"download_chunked {remote_quoted} {usable_lines}"
+    _run_helper(session, python_bin, helper_args, already_on_alt=already_on_alt)
+
+    # Wait for TC_DL_INFO (helper writes to alt-screen)
+    info_marker, _ = _wait_for_any_text(
+        session, ["TC_DL_INFO", "TC_ERR"], timeout=timeout,
+    )
+    if info_marker == "TC_ERR":
+        screen = _capture_screen(session, trim=True)
+        err_msg = "Remote helper reported an error"
+        m = re.search(r"TC_ERR\s+(.+)", screen)
+        if m:
+            err_msg = m.group(1).strip()
+        _dismiss_helper(session)
+        _wait_for_prompt(session, 5.0)
+        raise RuntimeError(err_msg)
+    if info_marker is None:
+        raise OperationTimeout("download_info did not complete within timeout")
+
+    # Use regex to handle line wrapping on narrow terminals.
+    screen = _capture_screen(session, trim=True)
+    total_b64_lines = 0
+    remote_sha = ""
+    m = re.search(r"TC_DL_INFO\s+(\d+)\s+([0-9a-f]{64})", screen)
+    if m:
+        total_b64_lines = int(m.group(1))
+        remote_sha = m.group(2)
+
+    if total_b64_lines == 0:
+        # Empty file — dismiss helper and return
+        _dismiss_helper(session)
+        _wait_for_prompt(session, timeout)
+        return (b"", remote_sha)
+
+    if verbose:
+        _eprint(f"Total base64 lines: {total_b64_lines}")
+
+    accumulated: list[str] = []
+    offset = 0
+    chunk_idx = 0
+
+    while offset < total_b64_lines:
+        count = min(usable_lines, total_b64_lines - offset)
+
+        # Send ack to request next chunk
+        _run_tmux(["send-keys", "-t", _exact(session), "n"])
+
+        # Wait for TC_E <chunk_idx> (end of chunk) on alt-screen.
+        # Including the chunk index avoids matching a stale TC_E from
+        # the previous chunk that hasn't been cleared yet.
+        tc_e_marker = f"TC_E {chunk_idx}"
+        chunk_end_ok, _ = _wait_for_text(session, tc_e_marker, timeout=timeout)
+        if not chunk_end_ok:
+            # Check for remote error before raising generic timeout
+            screen = _capture_screen(session, trim=True)
+            m = re.search(r"TC_ERR\s+(.+)", screen)
+            if m:
+                _dismiss_helper(session)
+                _wait_for_prompt(session, 5.0)
+                raise RuntimeError(m.group(1).strip())
+            raise OperationTimeout(
+                f"chunked download stalled at offset {offset}/{total_b64_lines}"
+            )
+
+        # Capture alt-screen and extract data between TC_C and TC_E
+        screen = _capture_screen(session, trim=True, join_wrapped=False)
+        lines = screen.splitlines()
+
+        tc_c_marker = f"TC_C {chunk_idx}"
+        in_data = False
+        chunk_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped == tc_e_marker:
+                break
+            if in_data and stripped:
+                if _B64_LINE_RE.match(stripped):
+                    chunk_lines.append(stripped)
+                # else: noise line — skip silently
+            if stripped == tc_c_marker:
+                in_data = True
+
+        accumulated.extend(chunk_lines)
+        if verbose and len(chunk_lines) != count:
+            _eprint(
+                f"  chunked: expected {count} lines in chunk {chunk_idx}, "
+                f"got {len(chunk_lines)} (hash check will catch corruption)"
+            )
+        offset += count
+        chunk_idx += 1
+
+        if verbose:
+            pct = min(100, int(offset / total_b64_lines * 100))
+            prev_pct = min(100, int((offset - count) / total_b64_lines * 100))
+            if pct // 10 != prev_pct // 10 or offset >= total_b64_lines:
+                _eprint(f"  chunked: {pct}% ({offset}/{total_b64_lines} lines)")
+
+    # Wait for TC_DONE after last chunk
+    done_ok, _ = _wait_for_text(session, "TC_DONE", timeout=timeout)
+    if not done_ok:
+        raise OperationTimeout("chunked download: TC_DONE not received")
+
+    # Parse TC_DONE to get sha (may differ from TC_DL_INFO if file changed).
+    # Use regex to handle line wrapping on narrow terminals.
+    screen = _capture_screen(session, trim=True)
+    m = re.search(r"TC_DONE\s+([0-9a-f]{64})", screen)
+    if m:
+        remote_sha = m.group(1)
+
+    # Dismiss helper and wait for prompt
+    _dismiss_helper(session)
+    _wait_for_prompt(session, timeout)
+
+    b64_data = "\n".join(accumulated)
+    try:
+        decoded = base64.b64decode(b64_data)
+    except Exception as e:
+        raise RuntimeError(f"base64 decode failed after chunked download: {e}")
+
+    try:
+        decoded = gzip.decompress(decoded)
+    except Exception as e:
+        raise RuntimeError(f"gzip decompress failed after chunked download: {e}")
+
+
+    return (decoded, remote_sha)
+
 
 # ----------------------------
 # Commands
@@ -468,7 +1554,14 @@ def cmd_start(args: argparse.Namespace) -> None:
     # Workaround: some tmux versions ignore -x/-y on new-session -d when
     # window-size is manual, so enforce size with resize-window after creation.
     if not args.no_size:
-        _run_tmux(["resize-window", "-t", session, "-x", str(cols), "-y", str(rows)])
+        _run_tmux(["resize-window", "-t", _exact(session), "-x", str(cols), "-y", str(rows)])
+
+    # Pin window size so tmux never resizes it based on attached clients.
+    # Agent-managed sessions should only be resized explicitly via
+    # ``term-cli resize``.  Without this, tmux's global window-size policy
+    # (default: "latest") would resize the window whenever a client
+    # attaches to *any* session on the same server.
+    _run_tmux(["set-option", "-t", _exact(session), "window-size", "manual"])
 
     # Set locked flag if requested
     if args.locked:
@@ -514,7 +1607,7 @@ def cmd_kill(args: argparse.Namespace) -> None:
                     )
         # All validated, proceed with kill
         for session in sessions:
-            res = _run_tmux(["kill-session", "-t", session])
+            res = _run_tmux(["kill-session", "-t", _exact(session)])
             if not res.ok:
                 raise RuntimeError(res.stderr.strip() or f"Failed to kill session '{session}'")
             print(f"Killed session '{session}'")
@@ -534,7 +1627,7 @@ def cmd_kill(args: argparse.Namespace) -> None:
                 f"Use --force to kill anyway."
             )
     
-    res = _run_tmux(["kill-session", "-t", session])
+    res = _run_tmux(["kill-session", "-t", _exact(session)])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to kill session")
     print(f"Killed session '{session}'")
@@ -545,12 +1638,12 @@ def cmd_send_text(args: argparse.Namespace) -> None:
     _require_session(session)
     _require_unlocked(session)
 
-    res = _run_tmux(["send-keys", "-t", session, "--", args.text])
+    res = _run_tmux(["send-keys", "-t", _exact(session), "--", args.text])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to send text")
 
     if args.enter:
-        res2 = _run_tmux(["send-keys", "-t", session, "Enter"])
+        res2 = _run_tmux(["send-keys", "-t", _exact(session), "Enter"])
         if not res2.ok:
             raise RuntimeError(res2.stderr.strip() or "Failed to send Enter")
 
@@ -560,7 +1653,7 @@ def cmd_send_key(args: argparse.Namespace) -> None:
     _require_session(session)
     _require_unlocked(session)
 
-    res = _run_tmux(["send-keys", "-t", session, args.key])
+    res = _run_tmux(["send-keys", "-t", _exact(session), args.key])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to send key")
 
@@ -597,7 +1690,7 @@ def cmd_send_stdin(args: argparse.Namespace) -> None:
         raise RuntimeError(proc.stderr.strip() or "Failed to load buffer")
     
     # Paste buffer into the session
-    res = _run_tmux(["paste-buffer", "-t", session])
+    res = _run_tmux(["paste-buffer", "-t", _exact(session)])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to paste buffer")
     
@@ -615,10 +1708,10 @@ def cmd_run(args: argparse.Namespace) -> None:
     _require_session(session)
     _require_unlocked(session)
 
-    res = _run_tmux(["send-keys", "-t", session, "--", args.command])
+    res = _run_tmux(["send-keys", "-t", _exact(session), "--", args.command])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to send command")
-    res2 = _run_tmux(["send-keys", "-t", session, "Enter"])
+    res2 = _run_tmux(["send-keys", "-t", _exact(session), "Enter"])
     if not res2.ok:
         raise RuntimeError(res2.stderr.strip() or "Failed to send Enter")
 
@@ -653,7 +1746,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
             raise ValueError(f"--scrollback must be positive, got: {scrollback}")
         # Capture scrollback history with -J (join wrapped lines for logical lines).
         # Use a generous -S to grab more than needed, then truncate to exactly N lines.
-        tmux_args = ["capture-pane", "-p", "-J", "-t", session, "-S", f"-{scrollback}"]
+        tmux_args = ["capture-pane", "-p", "-J", "-t", _exact(session), "-S", f"-{scrollback}"]
         if raw:
             tmux_args.insert(2, "-e")
         res = _run_tmux(tmux_args)
@@ -698,15 +1791,15 @@ def cmd_pipe_log(args: argparse.Namespace) -> None:
     
     if args.raw:
         # Raw output including escape codes
-        shell_cmd = f"cat >> {_shlex_quote(logfile)}"
+        shell_cmd = f"cat >> {shlex.quote(logfile)}"
     else:
         # Strip ANSI escape codes using perl (more comprehensive than sed)
         # Handles: CSI sequences, OSC sequences, bracketed paste mode, etc.
         # Use unbuffered mode for real-time output
         strip_cmd = r"perl -pe 'BEGIN{$|=1} s/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b\[\?[0-9;]*[hl]//g'"
-        shell_cmd = f"{strip_cmd} >> {_shlex_quote(logfile)}"
+        shell_cmd = f"{strip_cmd} >> {shlex.quote(logfile)}"
     
-    res = _run_tmux(["pipe-pane", "-o", "-t", session, shell_cmd])
+    res = _run_tmux(["pipe-pane", "-o", "-t", _exact(session), shell_cmd])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to pipe pane")
     
@@ -718,7 +1811,7 @@ def cmd_unpipe(args: argparse.Namespace) -> None:
     session = args.session
     _require_session(session)
 
-    res = _run_tmux(["pipe-pane", "-t", session])
+    res = _run_tmux(["pipe-pane", "-t", _exact(session)])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to stop piping")
     print(f"Stopped piping output")
@@ -823,7 +1916,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     
     # Get comprehensive session and pane info
     fmt = "#{session_name}\t#{session_created}\t#{session_windows}\t#{session_attached}\t#{pane_width}\t#{pane_height}\t#{pane_pid}\t#{alternate_on}"
-    res = _run_tmux(["display-message", "-p", "-t", session, fmt])
+    res = _run_tmux(["display-message", "-p", "-t", _exact(session), fmt])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to read session info")
 
@@ -913,7 +2006,7 @@ def cmd_resize(args: argparse.Namespace) -> None:
     rows = rows if rows is not None else current_rows
 
     # Resize using resize-window
-    res = _run_tmux(["resize-window", "-t", session, "-x", str(cols), "-y", str(rows)])
+    res = _run_tmux(["resize-window", "-t", _exact(session), "-x", str(cols), "-y", str(rows)])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to resize session")
     
@@ -931,7 +2024,7 @@ def cmd_scroll(args: argparse.Namespace) -> None:
     abs_lines = abs(lines)
 
     # Enter copy mode and scroll
-    res = _run_tmux(["copy-mode", "-t", session])
+    res = _run_tmux(["copy-mode", "-t", _exact(session)])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to enter copy mode")
 
@@ -939,11 +2032,11 @@ def cmd_scroll(args: argparse.Namespace) -> None:
     if lines < 0:
         # Scroll up
         for _ in range(abs_lines):
-            _run_tmux(["send-keys", "-t", session, "-X", "scroll-up"])
+            _run_tmux(["send-keys", "-t", _exact(session), "-X", "scroll-up"])
     else:
         # Scroll down
         for _ in range(abs_lines):
-            _run_tmux(["send-keys", "-t", session, "-X", "scroll-down"])
+            _run_tmux(["send-keys", "-t", _exact(session), "-X", "scroll-down"])
 
     print(f"Scrolled {direction} {abs_lines} lines")
 
@@ -1038,7 +2131,7 @@ def cmd_wait_for(args: argparse.Namespace) -> None:
 
 def _get_session_attached_count(session: str) -> int:
     """Get number of clients attached to session."""
-    res = _run_tmux(["display-message", "-p", "-t", session, "#{session_attached}"])
+    res = _run_tmux(["display-message", "-p", "-t", _exact(session), "#{session_attached}"])
     if res.ok:
         try:
             return int(res.stdout.strip())
@@ -1049,7 +2142,7 @@ def _get_session_attached_count(session: str) -> int:
 
 def _get_request(session: str) -> str | None:
     """Get pending request message for session, or None if no request."""
-    res = _run_tmux(["show-option", "-t", session, "-qv", TERM_CLI_REQUEST_OPT])
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_REQUEST_OPT])
     if res.ok and res.stdout.strip():
         return res.stdout.strip()
     return None
@@ -1057,12 +2150,12 @@ def _get_request(session: str) -> str | None:
 
 def _clear_request(session: str) -> None:
     """Clear pending request for session."""
-    _run_tmux(["set-option", "-t", session, "-u", TERM_CLI_REQUEST_OPT])
+    _run_tmux(["set-option", "-t", _exact(session), "-u", TERM_CLI_REQUEST_OPT])
 
 
 def _get_response(session: str) -> str | None:
     """Get response message for session, or None if no response."""
-    res = _run_tmux(["show-option", "-t", session, "-qv", TERM_CLI_RESPONSE_OPT])
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_RESPONSE_OPT])
     if res.ok and res.stdout.strip():
         return res.stdout.strip()
     return None
@@ -1070,23 +2163,23 @@ def _get_response(session: str) -> str | None:
 
 def _clear_response(session: str) -> None:
     """Clear response for session."""
-    _run_tmux(["set-option", "-t", session, "-u", TERM_CLI_RESPONSE_OPT])
+    _run_tmux(["set-option", "-t", _exact(session), "-u", TERM_CLI_RESPONSE_OPT])
 
 
 def _get_detached(session: str) -> bool:
     """Check if detached flag is set for session."""
-    res = _run_tmux(["show-option", "-t", session, "-qv", TERM_CLI_DETACHED_OPT])
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_DETACHED_OPT])
     return res.ok and res.stdout.strip() != ""
 
 
 def _clear_detached(session: str) -> None:
     """Clear detached flag for session."""
-    _run_tmux(["set-option", "-t", session, "-u", TERM_CLI_DETACHED_OPT])
+    _run_tmux(["set-option", "-t", _exact(session), "-u", TERM_CLI_DETACHED_OPT])
 
 
 def _is_locked(session: str) -> bool:
     """Check if session is locked (agent read-only mode)."""
-    res = _run_tmux(["show-option", "-t", session, "-qv", TERM_CLI_LOCKED_OPT])
+    res = _run_tmux(["show-option", "-t", _exact(session), "-qv", TERM_CLI_LOCKED_OPT])
     return res.ok and res.stdout.strip() != ""
 
 
@@ -1098,12 +2191,323 @@ def _require_unlocked(session: str) -> None:
 
 def _set_locked(session: str) -> None:
     """Lock session (agent read-only mode)."""
-    _run_tmux(["set-option", "-t", session, TERM_CLI_LOCKED_OPT, "1"])
+    _run_tmux(["set-option", "-t", _exact(session), TERM_CLI_LOCKED_OPT, "1"])
 
 
-def _clear_locked(session: str) -> None:
-    """Unlock session."""
-    _run_tmux(["set-option", "-t", session, "-u", TERM_CLI_LOCKED_OPT])
+def cmd_upload(args: argparse.Namespace) -> None:
+    """Upload a local file (or stdin) to the session's shell (e.g. over SSH)."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+    _require_prompt_ready(session)
+
+    pane_w, _ = _get_pane_dimensions(session)
+    if pane_w < MIN_TRANSFER_COLS:
+        raise ValueError(
+            f"Terminal too narrow for file transfers: {pane_w} columns "
+            f"(minimum {MIN_TRANSFER_COLS}). Resize with: term-cli resize -s {session} -x {MIN_TRANSFER_COLS}"
+        )
+
+    local_path = args.local_path
+    from_stdin = local_path == "-"
+
+    if from_stdin:
+        if sys.stdin.isatty():
+            raise ValueError(
+                "Refusing to read from terminal — pipe data to stdin "
+                "(e.g. cat file | term-cli upload -s NAME - REMOTE_PATH)"
+            )
+        if not args.remote_path:
+            raise ValueError(
+                "REMOTE_PATH is required when uploading from stdin"
+            )
+        raw_data = sys.stdin.buffer.read()
+    else:
+        if not os.path.isfile(local_path):
+            raise ValueError(f"Local file does not exist: {local_path}")
+        with open(local_path, "rb") as f:
+            raw_data = f.read()
+
+    if not raw_data:
+        src = "stdin" if from_stdin else local_path
+        raise ValueError(f"No data to upload ({src} is empty)")
+
+    remote_path = args.remote_path or os.path.basename(local_path)
+    timeout: float = args.timeout if args.timeout is not None else DEFAULT_TRANSFER_TIMEOUT
+    verbose: bool = args.verbose
+    force: bool = args.force
+
+    remote_quoted = shlex.quote(remote_path)
+
+    # Probe for Python 3 and check file existence on alt-screen so the
+    # probe commands don't clutter the user's visible terminal.
+    # _hide_probe_start enters alt-screen (saving normal screen with the
+    # echoed command on the prompt line).  _run_helper(already_on_alt=True)
+    # leaves alt-screen, erases the prompt line, then the helper re-enters
+    # alt-screen saving the cleaned normal screen.
+    _hide_probe_start(session)
+    try:
+        python_bin = _probe_python(session, timeout)
+        file_exists = not force and _remote_file_exists(session, remote_path, timeout)
+    except BaseException:
+        _restore_terminal(session)
+        raise
+
+    if file_exists:
+        _restore_terminal(session)
+        raise ValueError(
+            f"Remote file already exists: {remote_path} (use --force to overwrite)"
+        )
+
+    if verbose:
+        _eprint(f"Remote Python: {python_bin}")
+
+    # Always compress with gzip
+    payload = gzip.compress(raw_data, compresslevel=6)
+    if verbose:
+        ratio = len(payload) / len(raw_data) * 100
+        _eprint(f"Compressed {len(raw_data)} -> {len(payload)} bytes ({ratio:.0f}%)")
+
+    b64_data = base64.encodebytes(payload).decode("ascii")
+
+    # Compute local hash for verification (always sha256 via Python helper)
+    local_sha = hashlib.sha256(raw_data).hexdigest()
+
+    start_time = time.time()
+    try:
+        # Deploy Python helper with upload command
+        helper_args = f"upload {remote_quoted} {len(b64_data)}"
+        _run_helper(session, python_bin, helper_args, already_on_alt=True)
+
+        # Wait for TC_READY (trial write succeeded, script is reading /dev/tty)
+        # or TC_NOWRITE (destination not writable) or TC_ERR.
+        # Use up to 30s or the caller's timeout, whichever is smaller — the
+        # helper needs time to start up (paste + python3 + gzip decompress)
+        # which can be slow over SSH.
+        ready_timeout = min(timeout, 30.0)
+        marker, _ = _wait_for_any_text(
+            session, ["TC_READY", "TC_NOWRITE", "TC_ERR"], timeout=ready_timeout,
+        )
+        if marker == "TC_NOWRITE":
+            _dismiss_helper(session)
+            _wait_for_prompt(session, 5.0)
+            raise ValueError(
+                f"Cannot write to remote path: {remote_path} "
+                "(permission denied or directory does not exist)"
+            )
+        if marker == "TC_ERR":
+            screen = _capture_screen(session, trim=True)
+            err_msg = "Remote helper reported an error"
+            m = re.search(r"TC_ERR\s+(.+)", screen)
+            if m:
+                err_msg = m.group(1).strip()
+            _dismiss_helper(session)
+            _wait_for_prompt(session, 5.0)
+            raise RuntimeError(err_msg)
+        if marker is None:
+            raise OperationTimeout(
+                f"Receiver did not become ready within {ready_timeout:.0f}s "
+                "(TC_READY not seen — is the remote shell responsive?)"
+            )
+
+        # Paste base64 payload — script reads exactly len(b64_data) bytes from /dev/tty
+        if verbose:
+            _eprint(f"Pasting {len(b64_data)} bytes of base64 data...")
+        _load_and_paste(session, b64_data)
+
+        # Wait for TC_DONE <sha256> (script finished writing + hashing)
+        done_marker, _ = _wait_for_any_text(
+            session, ["TC_DONE", "TC_ERR"], timeout=timeout,
+        )
+        if done_marker == "TC_ERR":
+            screen = _capture_screen(session, trim=True)
+            err_msg = "Remote helper reported an error"
+            m = re.search(r"TC_ERR\s+(.+)", screen)
+            if m:
+                err_msg = m.group(1).strip()
+            _dismiss_helper(session)
+            _wait_for_prompt(session, 5.0)
+            raise RuntimeError(err_msg)
+        if done_marker is None:
+            raise OperationTimeout(f"upload did not complete within {timeout}s")
+
+        # Parse TC_DONE to extract remote sha256.
+        # Use regex on the raw capture to handle line wrapping on narrow terminals.
+        screen = _capture_screen(session, trim=True)
+        remote_sha: str | None = None
+        m = re.search(r"TC_DONE\s+([0-9a-f]{64})", screen)
+        if m:
+            remote_sha = m.group(1)
+
+        # Dismiss the helper (it's blocking on _wait_for_dismiss on alt-screen)
+        _dismiss_helper(session)
+
+        # Wait for prompt to return (helper exits, alt-screen closes, stty echo restored)
+        _wait_for_prompt(session, timeout)
+
+        # Verify hash
+        if remote_sha:
+            if local_sha != remote_sha:
+                # Clean up corrupt file
+                _remote_exec(session, f"rm -f {remote_quoted}", 5.0)
+                raise RuntimeError(
+                    f"Hash mismatch (sha256): "
+                    f"local={local_sha[:16]}... remote={remote_sha[:16]}..."
+                )
+            if verbose:
+                _eprint(f"Hash verified (sha256): {local_sha[:16]}...")
+        else:
+            _eprint("Warning: could not parse remote hash from TC_DONE marker")
+
+        total_time = time.time() - start_time
+        size_str = _format_size(len(raw_data))
+        print(f"Uploaded {size_str} to '{remote_path}' ({total_time:.1f}s)")
+
+    except BaseException:
+        _restore_terminal(session)
+        raise
+
+
+def cmd_download(args: argparse.Namespace) -> None:
+    """Download a file from the session's shell to the local machine (or stdout)."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+    _require_prompt_ready(session)
+
+    pane_w, _ = _get_pane_dimensions(session)
+    if pane_w < MIN_TRANSFER_COLS:
+        raise ValueError(
+            f"Terminal too narrow for file transfers: {pane_w} columns "
+            f"(minimum {MIN_TRANSFER_COLS}). Resize with: term-cli resize -s {session} -x {MIN_TRANSFER_COLS}"
+        )
+
+    remote_path = args.remote_path
+    to_stdout = args.local_path == "-"
+
+    if to_stdout:
+        local_path = "-"
+    else:
+        local_path = os.path.abspath(args.local_path or os.path.basename(remote_path))
+
+    timeout: float = args.timeout if args.timeout is not None else DEFAULT_TRANSFER_TIMEOUT
+    verbose: bool = args.verbose
+    force: bool = args.force
+
+    # Check local path (skip for stdout)
+    if not to_stdout and not force and os.path.exists(local_path):
+        raise ValueError(
+            f"Local file already exists: {local_path} (use --force to overwrite)"
+        )
+
+    # Probe for Python 3 and check file existence on alt-screen so the
+    # probe commands don't clutter the user's visible terminal.
+    _hide_probe_start(session)
+    try:
+        python_bin = _probe_python(session, timeout)
+        file_exists = _remote_file_exists(session, remote_path, timeout)
+    except BaseException:
+        _restore_terminal(session)
+        raise
+
+    if not file_exists:
+        _restore_terminal(session)
+        raise ValueError(f"Remote file does not exist: {remote_path}")
+
+    if verbose:
+        _eprint(f"Remote Python: {python_bin}")
+
+    start_time = time.time()
+
+    # Check remembered strategy
+    strategy = _get_dl_strategy(session)
+    decoded: bytes | None = None
+    remote_sha: str = ""
+    # Track whether the probes' alt-screen is still active so we can pass
+    # already_on_alt=True to the first _run_helper call that will leave it.
+    on_probe_alt = True
+
+    try:
+        if strategy != "chunked":
+            # Try pipe-pane first
+            if verbose:
+                _eprint("Trying pipe-pane download strategy...")
+
+            # Use a local temp file for pipe-pane output
+            tmp_fd, tmp_path = tempfile.mkstemp(prefix="tc_dl_", suffix=".raw")
+            os.close(tmp_fd)
+            try:
+                result = _download_pipe(
+                    session, remote_path, tmp_path, python_bin,
+                    timeout, verbose,
+                    already_on_alt=True,
+                )
+                on_probe_alt = False
+            except Exception as exc:
+                if verbose:
+                    _eprint(f"Pipe-pane raised {type(exc).__name__}: {exc}")
+                # Clean up temp file on error
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                # Restore terminal to clean state before chunked fallback —
+                # the helper may still be running or the shell may not be
+                # at a prompt after the pipe-pane failure/timeout.
+                _restore_terminal(session)
+                on_probe_alt = False
+                result = None
+
+            if result is not None:
+                decoded, remote_sha = result
+            else:
+                if verbose:
+                    _eprint("Pipe-pane failed or corruption detected, switching to chunked")
+                _set_dl_strategy(session, "chunked")
+
+        if decoded is None:
+            # Chunked fallback
+            if verbose:
+                _eprint("Using chunked screen-capture download strategy...")
+            decoded, remote_sha = _download_chunked(
+                session, remote_path, python_bin, timeout, verbose,
+                already_on_alt=on_probe_alt,
+            )
+    except BaseException:
+        _restore_terminal(session)
+        raise
+
+    # Verify hash (always sha256 from Python helper)
+    if remote_sha:
+        local_sha = hashlib.sha256(decoded).hexdigest()
+        if local_sha != remote_sha:
+            raise RuntimeError(
+                f"Hash mismatch (sha256): "
+                f"remote={remote_sha[:16]}... local={local_sha[:16]}..."
+            )
+        if verbose:
+            _eprint(f"Hash verified (sha256): {local_sha[:16]}...")
+    else:
+        _eprint("Warning: could not verify hash (remote hash not received)")
+
+    if to_stdout:
+        # Write binary data to stdout
+        sys.stdout.buffer.write(decoded)
+        sys.stdout.buffer.flush()
+    else:
+        # Write to local file
+        parent = os.path.dirname(local_path)
+        if parent and not os.path.isdir(parent):
+            raise ValueError(f"Parent directory does not exist: {parent}")
+        with open(local_path, "wb") as f:
+            f.write(decoded)
+
+    total_time = time.time() - start_time
+    size_str = _format_size(len(decoded))
+    dest = "stdout" if to_stdout else f"'{local_path}'"
+    # Use _eprint for stdout mode so binary data isn't mixed with status
+    output_fn = _eprint if to_stdout else print
+    output_fn(f"Downloaded {size_str} to {dest} ({total_time:.1f}s)")
 
 
 def cmd_request(args: argparse.Namespace) -> None:
@@ -1117,7 +2521,7 @@ def cmd_request(args: argparse.Namespace) -> None:
     _clear_detached(session)
     
     # Store request in tmux user option (can be read via #{@term_cli_request} in format strings)
-    _run_tmux(["set-option", "-t", session, TERM_CLI_REQUEST_OPT, message])
+    _run_tmux(["set-option", "-t", _exact(session), TERM_CLI_REQUEST_OPT, message])
     print(f"Request stored for session '{session}'")
 
 
@@ -1211,6 +2615,7 @@ tmux keys: C-c C-d C-u C-z (ctrl), Enter Escape Space Tab BSpace, Up Down Left R
   term-cli capture --session build
   term-cli send-key --session build C-c
   term-cli wait --session build --timeout 10
+  term-cli upload --session build ./config.json /app/config.json
   term-cli kill --session build
 
 Short forms (commands and flags can be abbreviated):
@@ -1340,6 +2745,39 @@ Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var
     sp.add_argument("-C", "--print-match-context", type=int, metavar="N", help="Print N lines of context around match (implies --print-match)")
     sp.set_defaults(func=cmd_wait_for)
 
+    # upload
+    sp = sub.add_parser("upload",
+                        help="Upload local file to session, gzip-compressed (e.g. over SSH)",
+                        description="Upload a local file to the session's shell. Gzip-compressed, SHA-256 verified.\n"
+                                    "Requires python3 on the target system.\n"
+                                    "Session must be at a shell prompt (not running a command or TUI).")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("local_path", metavar="LOCAL_PATH",
+                    help="Local file to upload (use '-' for stdin)")
+    sp.add_argument("remote_path", metavar="REMOTE_PATH", nargs="?", default=None,
+                    help="Destination path (default: basename of LOCAL_PATH; required for stdin)")
+    sp.add_argument("-f", "--force", action="store_true", help="Overwrite if remote file exists")
+    sp.add_argument("-t", "--timeout", type=float, metavar="SEC",
+                    help=f"Transfer timeout (default: {DEFAULT_TRANSFER_TIMEOUT})")
+    sp.add_argument("-v", "--verbose", action="store_true", help="Show transfer progress details")
+    sp.set_defaults(func=cmd_upload)
+
+    # download
+    sp = sub.add_parser("download",
+                        help="Download file from session, gzip-compressed",
+                        description="Download a file from the session's shell. Gzip-compressed, SHA-256 verified.\n"
+                                    "Requires python3 on the target system.\n"
+                                    "Session must be at a shell prompt (not running a command or TUI).")
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    sp.add_argument("remote_path", metavar="REMOTE_PATH", help="Remote file to download")
+    sp.add_argument("local_path", metavar="LOCAL_PATH", nargs="?", default=None,
+                    help="Local destination (use '-' for stdout; default: basename of REMOTE_PATH)")
+    sp.add_argument("-f", "--force", action="store_true", help="Overwrite if local file exists")
+    sp.add_argument("-t", "--timeout", type=float, metavar="SEC",
+                    help=f"Transfer timeout (default: {DEFAULT_TRANSFER_TIMEOUT})")
+    sp.add_argument("-v", "--verbose", action="store_true", help="Show transfer progress details")
+    sp.set_defaults(func=cmd_download)
+
     # request
     sp = sub.add_parser("request", help="Request human assistance")
     sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
@@ -1369,6 +2807,7 @@ COMMANDS = [
     "list", "start", "kill", "run", "send-text", "send-key", "send-stdin",
     "capture", "pipe-log", "unpipe", "status", "resize", "scroll",
     "wait", "wait-idle", "wait-for",
+    "upload", "download",
     "request", "request-wait", "request-cancel", "request-status",
 ]
 
@@ -1448,6 +2887,10 @@ def main(argv: list[str] | None = None) -> int:
     except AgentLocked as e:
         _eprint(f"Error: {e}")
         return EXIT_LOCKED
+
+    except OSError as e:
+        _eprint(f"Error: {e}")
+        return EXIT_RUNTIME_ERROR
 
     except QueryResult as e:
         # Not an error - normal query result printed to stdout, specific exit code

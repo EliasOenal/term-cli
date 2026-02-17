@@ -6,6 +6,7 @@ jobs:
   test:
 
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     permissions:
       contents: read
 
@@ -16,22 +17,28 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      timeout-minutes: 10
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
+      timeout-minutes: 10
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install tmux (Ubuntu)
       if: runner.os == 'Linux'
+      timeout-minutes: 10
       run: sudo apt-get update && sudo apt-get install -y tmux
     - name: Install tmux (macOS)
       if: runner.os == 'macOS'
+      timeout-minutes: 10
       run: brew install tmux
     - name: Install test dependencies
+      timeout-minutes: 10
       run: pip install -r requirements-test.txt
     - name: Run tests
+      timeout-minutes: 10
       run: ./run-tests.sh
-      timeout-minutes: 60
     - name: Test installer (user-local)
+      timeout-minutes: 10
       run: |
         ./install.sh --no-skill
         test -x ~/.local/bin/term-cli
@@ -42,6 +49,7 @@ jobs:
         test ! -f ~/.local/bin/term-cli
         test ! -f ~/.local/bin/term-assist
     - name: Test installer (system-wide)
+      timeout-minutes: 10
       run: |
         ./install.sh --system --no-skill
         test -x /usr/local/bin/term-cli

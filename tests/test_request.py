@@ -317,7 +317,7 @@ class TestResponseMessage:
         
         # Manually set a response (simulating partial completion)
         subprocess.run(
-            ["tmux", "-L", tmux_socket, "set-option", "-t", session, "@term_cli_response", "test response"],
+            ["tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:", "@term_cli_response", "test response"],
             capture_output=True,
         )
         
@@ -327,7 +327,7 @@ class TestResponseMessage:
         
         # Verify response was also cleared
         check = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-t", session, "-qv", "@term_cli_response"],
+            ["tmux", "-L", tmux_socket, "show-option", "-t", f"={session}:", "-qv", "@term_cli_response"],
             capture_output=True,
             text=True,
         )
@@ -361,7 +361,7 @@ class TestMessageIntegrity:
         
         # Read raw value from tmux
         result = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-t", session, "-qv", "@term_cli_request"],
+            ["tmux", "-L", tmux_socket, "show-option", "-t", f"={session}:", "-qv", "@term_cli_request"],
             capture_output=True,
             text=True,
         )
@@ -422,13 +422,13 @@ class TestMessageIntegrity:
         # But first we need to capture before it's cleared
         # So we'll manually set the option to test what term-cli reads
         subprocess.run(
-            ["tmux", "-L", tmux_socket, "set-option", "-t", session, "@term_cli_response", test_response],
+            ["tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:", "@term_cli_response", test_response],
             capture_output=True,
         )
         
         # Read it back
         result = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-t", session, "-qv", "@term_cli_response"],
+            ["tmux", "-L", tmux_socket, "show-option", "-t", f"={session}:", "-qv", "@term_cli_response"],
             capture_output=True,
             text=True,
         )
@@ -444,7 +444,7 @@ class TestMessageIntegrity:
         term_cli("request", "-s", session, "-m", test_msg)
         
         result = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-t", session, "-qv", "@term_cli_request"],
+            ["tmux", "-L", tmux_socket, "show-option", "-t", f"={session}:", "-qv", "@term_cli_request"],
             capture_output=True,
             text=True,
         )
@@ -539,13 +539,13 @@ class TestDetachBehavior:
         # Simulate what happens when term-assist detach hook runs:
         # Set the detached flag (normally done by the hook)
         subprocess.run(
-            ["tmux", "-L", tmux_socket, "set-option", "-t", session, "@term_cli_detached", "1"],
+            ["tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:", "@term_cli_detached", "1"],
             capture_output=True,
         )
         
         # Verify the flag is set
         check = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-t", session, "-qv", "@term_cli_detached"],
+            ["tmux", "-L", tmux_socket, "show-option", "-t", f"={session}:", "-qv", "@term_cli_detached"],
             capture_output=True,
             text=True,
         )
@@ -585,7 +585,7 @@ class TestDetachBehavior:
         
         # Simulate detach by setting the flag
         subprocess.run(
-            ["tmux", "-L", tmux_socket, "set-option", "-t", session, "@term_cli_detached", "1"],
+            ["tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:", "@term_cli_detached", "1"],
             capture_output=True,
         )
         
@@ -610,7 +610,7 @@ class TestDetachBehavior:
         
         # First: simulate detach
         subprocess.run(
-            ["tmux", "-L", tmux_socket, "set-option", "-t", session, "@term_cli_detached", "1"],
+            ["tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:", "@term_cli_detached", "1"],
             capture_output=True,
         )
         
@@ -642,7 +642,7 @@ class TestDetachBehavior:
         
         # Clear the request (simulating done)
         subprocess.run(
-            ["tmux", "-L", tmux_socket, "set-option", "-u", "-t", session, "@term_cli_request"],
+            ["tmux", "-L", tmux_socket, "set-option", "-u", "-t", f"={session}:", "@term_cli_request"],
             capture_output=True,
         )
         
@@ -662,7 +662,7 @@ class TestDetachBehavior:
         
         # Set detached flag (simulating a previous detach)
         subprocess.run(
-            ["tmux", "-L", tmux_socket, "set-option", "-t", session, "@term_cli_detached", "1"],
+            ["tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:", "@term_cli_detached", "1"],
             capture_output=True,
         )
         
@@ -672,7 +672,7 @@ class TestDetachBehavior:
         
         # Detached flag should be cleared
         check = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-t", session, "-qv", "@term_cli_detached"],
+            ["tmux", "-L", tmux_socket, "show-option", "-t", f"={session}:", "-qv", "@term_cli_detached"],
             capture_output=True,
             text=True,
         )
@@ -684,7 +684,7 @@ class TestDetachBehavior:
         
         # Set a stale detached flag
         subprocess.run(
-            ["tmux", "-L", tmux_socket, "set-option", "-t", session, "@term_cli_detached", "1"],
+            ["tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:", "@term_cli_detached", "1"],
             capture_output=True,
         )
         
@@ -693,7 +693,7 @@ class TestDetachBehavior:
         
         # Detached flag should be cleared
         check = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-t", session, "-qv", "@term_cli_detached"],
+            ["tmux", "-L", tmux_socket, "show-option", "-t", f"={session}:", "-qv", "@term_cli_detached"],
             capture_output=True,
             text=True,
         )
@@ -708,7 +708,7 @@ class TestDetachBehavior:
         
         # Set detached flag
         subprocess.run(
-            ["tmux", "-L", tmux_socket, "set-option", "-t", session, "@term_cli_detached", "1"],
+            ["tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:", "@term_cli_detached", "1"],
             capture_output=True,
         )
         
@@ -718,7 +718,7 @@ class TestDetachBehavior:
         
         # Detached flag should be cleared
         check = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-t", session, "-qv", "@term_cli_detached"],
+            ["tmux", "-L", tmux_socket, "show-option", "-t", f"={session}:", "-qv", "@term_cli_detached"],
             capture_output=True,
             text=True,
         )
@@ -752,7 +752,7 @@ class TestDetachBehavior:
         
         # Simulate detach
         subprocess.run(
-            ["tmux", "-L", tmux_socket, "set-option", "-t", session, "@term_cli_detached", "1"],
+            ["tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:", "@term_cli_detached", "1"],
             capture_output=True,
         )
         

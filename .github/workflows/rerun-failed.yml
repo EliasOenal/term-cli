@@ -1,0 +1,33 @@
+name: Rerun failed jobs
+
+on:
+  workflow_run:
+    workflows: [Tests]
+    types: [completed]
+
+jobs:
+  rerun:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const run = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.payload.workflow_run.id,
+            });
+            if (run.data.run_attempt >= 2) {
+              console.log('Already retried, not re-running again');
+              return;
+            }
+            await github.rest.actions.reRunWorkflowFailedJobs({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.payload.workflow_run.id,
+            });
+            console.log('Re-running failed jobs on fresh runners');

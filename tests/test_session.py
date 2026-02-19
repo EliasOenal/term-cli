@@ -355,14 +355,24 @@ class TestList:
         assert s1 in result.stdout
         assert s2 in result.stdout
 
-    def test_list_empty(self, term_cli):
+    def test_list_empty(self):
         """list with no sessions outputs nothing."""
-        # Kill all first
-        term_cli("kill", "--all")
-        
-        result = term_cli("list")
-        assert result.ok
-        assert result.stdout.strip() == ""
+        # Use a fresh socket with no sessions to avoid disturbing module fixtures.
+        fresh_socket = f"pytest_isolated_{uuid.uuid4().hex[:8]}"
+        try:
+            result = subprocess.run(
+                [str(TERM_CLI), "-L", fresh_socket, "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            assert result.returncode == 0
+            assert result.stdout.strip() == ""
+        finally:
+            subprocess.run(
+                ["tmux", "-L", fresh_socket, "kill-server"],
+                capture_output=True,
+            )
 
     def test_list_one_per_line(self, session_factory, term_cli):
         """list outputs one session per line."""
@@ -387,6 +397,7 @@ class TestStatus:
         assert "State:" in result.stdout
         assert "Screen:" in result.stdout
         assert "Size:" in result.stdout
+        assert "Cursor:" in result.stdout
         assert "Processes:" in result.stdout
         # Shell should be in the process tree with a PID
         assert "└─" in result.stdout
@@ -484,3 +495,50 @@ class TestStatus:
         # Quit vim
         term_cli("send-text", "-s", session, ":q!", "-e")
         term_cli("wait", "-s", session, "-t", "15")
+
+    def test_status_shows_cursor_position(self, session, term_cli):
+        """status shows Cursor: row,col position (1-based)."""
+        import re
+
+        result = term_cli("status", "-s", session)
+        assert result.ok
+        assert "Cursor:" in result.stdout
+        match = re.search(r"Cursor: (\d+),(\d+)", result.stdout)
+        assert match is not None
+        row = int(match.group(1))
+        col = int(match.group(2))
+        assert row >= 1
+        assert col >= 1
+
+    def test_status_shows_mouse_mode_details(self, session, term_cli):
+        """status shows tmux mouse mode flags and preferred encoding."""
+        import re
+
+        result = term_cli("status", "-s", session)
+        assert result.ok
+        m = re.search(
+            r"Mouse: (off|x10|utf8|sgr) \(std=[01] btn=[01] all=[01] utf8=[01] sgr=[01]\)",
+            result.stdout,
+        )
+        assert m is not None
+
+    def test_status_shows_title(self, session, term_cli):
+        """status shows pane title."""
+        # Set a custom title via OSC escape sequence
+        term_cli("run", "-s", session,
+                 r"printf '\033]0;my-status-app\007'", "-w")
+        result = term_cli("status", "-s", session)
+        assert result.ok
+        assert "Title: my-status-app" in result.stdout
+
+    def test_status_shows_bell(self, session, term_cli):
+        """status shows bell and clears the flag."""
+        term_cli("run", "-s", session, r"printf '\a'", "-w")
+        # First status should show bell
+        result = term_cli("status", "-s", session)
+        assert result.ok
+        assert "Bell: yes (cleared)" in result.stdout
+        # Second status should NOT show bell (it was cleared)
+        result2 = term_cli("status", "-s", session)
+        assert result2.ok
+        assert "Bell:" not in result2.stdout

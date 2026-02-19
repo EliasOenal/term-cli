@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import RunResult, unique_session_name
+from conftest import RunResult, TERM_CLI, unique_session_name
 
 
 class TestLockedSessionStart:
@@ -125,6 +125,35 @@ class TestLockedCommandsBlocked:
         assert result.returncode == 5
         assert "locked" in result.stderr.lower()
         
+        # Clean up
+        term_cli("kill", "-s", session, "-f")
+
+    def test_send_stdin_blocked_on_locked(self, term_cli, tmux_socket):
+        """send-stdin command returns exit code 5 on locked session."""
+        session = unique_session_name()
+        term_cli("start", "-s", session, "-l")
+
+        result = subprocess.run(
+            [str(TERM_CLI), "-L", tmux_socket, "send-stdin", "-s", session],
+            input="echo blocked\n",
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 5
+        assert "locked" in result.stderr.lower()
+
+        # Clean up
+        term_cli("kill", "-s", session, "-f")
+
+    def test_send_mouse_blocked_on_locked(self, term_cli, tmux_socket):
+        """send-mouse command returns exit code 5 on locked session."""
+        session = unique_session_name()
+        term_cli("start", "-s", session, "-l")
+
+        result = term_cli("send-mouse", "-s", session, "--x", "0", "--y", "0")
+        assert result.returncode == 5
+        assert "locked" in result.stderr.lower()
+
         # Clean up
         term_cli("kill", "-s", session, "-f")
 

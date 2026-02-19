@@ -23,17 +23,20 @@ jobs:
       timeout-minutes: 10
       with:
         python-version: ${{ matrix.python-version }}
-    - name: Install tmux (Ubuntu)
+    - name: Install tmux + TUIs (Ubuntu)
       if: runner.os == 'Linux'
       timeout-minutes: 10
-      run: sudo apt-get update && sudo apt-get install -y tmux
-    - name: Install tmux (macOS)
+      run: sudo apt-get update && sudo apt-get install -y tmux htop mc
+    - name: Install tmux + TUIs (macOS)
       if: runner.os == 'macOS'
       timeout-minutes: 10
-      run: brew install tmux
+      run: brew install tmux htop mc
     - name: Install test dependencies
       timeout-minutes: 10
       run: pip install -r requirements-test.txt
+    - name: Run type checks
+      timeout-minutes: 10
+      run: pyright
     - name: Run tests
       timeout-minutes: 10
       run: ./run-tests.sh

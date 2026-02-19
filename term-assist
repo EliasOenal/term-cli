@@ -199,6 +199,11 @@ def _set_response(session: str, message: str) -> None:
     _run_tmux(["set-option", "-t", _exact(session), TERM_CLI_RESPONSE_OPT, message])
 
 
+def _clear_response(session: str) -> None:
+    """Clear response message for session."""
+    _run_tmux(["set-option", "-t", _exact(session), "-u", TERM_CLI_RESPONSE_OPT])
+
+
 def _list_sessions() -> list[str]:
     """Return list of all session names, or empty list if none exist."""
     res = _run_tmux(["list-sessions", "-F", "#{session_name}"])
@@ -408,7 +413,8 @@ def cmd_done(args: argparse.Namespace) -> None:
     if args.message and args.message_positional:
         raise ValueError("Cannot use both -m and positional message")
     
-    # Set response message if provided (before clearing request)
+    # Replace any stale response from previous requests.
+    _clear_response(session)
     if message:
         _set_response(session, message)
     

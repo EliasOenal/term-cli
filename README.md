@@ -20,7 +20,7 @@ Hand control to humans for passwords and MFA prompts. Or flip it: human drives w
 - **term-cli**: Agents run interactive programs in detached terminal sessions (tmux-backed)
 - **term-assist**: Humans collaborate, enter passwords, handle MFA, prepare sessions
 
-Single-file Python. No dependencies beyond tmux. 550+ tests, CI on every commit. BSD licensed.
+Single-file Python. No dependencies beyond tmux. 680+ tests, CI on every commit. BSD licensed.
 
 ## The Problem
 
@@ -187,8 +187,10 @@ Works with **Claude Code**, **Gemini CLI**, **Cursor**, **Aider**, **OpenCode**,
 | `run --session NAME "cmd" --wait --timeout 60` | Run command, wait for prompt |
 | `send-text --session NAME "text" --enter` | Send text (--enter for Enter key) |
 | `send-key --session NAME C-c` | Send special key |
+| `send-mouse --session NAME --text "Item"` | Click a visible TUI item (alternate screen mode) |
+| `send-mouse --session NAME --text "Item" --scroll-down 3` | Scroll at a visible TUI item |
 | `send-stdin --session NAME < file.txt` | Send multiline content |
-| `capture --session NAME` | Capture screen (--tail/--scrollback for more) |
+| `capture --session NAME` | Capture screen (auto-annotates active TUIs; --tail/--scrollback for more) |
 | `wait --session NAME --timeout 30` | Wait for prompt |
 | `wait-idle --session NAME --idle 2` | Wait for output to settle |
 | `wait-for --session NAME "pattern"` | Wait for text to appear (--print-match/--print-match-context N) |

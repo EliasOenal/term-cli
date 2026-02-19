@@ -46,9 +46,13 @@ term-cli run --session NAME "make test" --wait --timeout 60   # default: 10s
 term-cli send-text --session NAME ":wq" --enter && term-cli wait --session NAME
 term-cli send-key --session NAME C-c
 term-cli send-stdin --session NAME < file.txt
+term-cli send-mouse --session NAME --text "Item B"
+term-cli send-mouse --session NAME --text "Item B" --scroll-down 3
 ```
 
 Keys: `C-c` `C-d` `C-z` `C-u` `C-l` (ctrl), `Enter` `Escape` `Tab` `Space` `BSpace`, `Up` `Down` `Left` `Right`, `Home` `End` `PPage` `NPage`, `F1`-`F12`
+
+`send-mouse` works only in alternate screen mode (active TUI). Prefer `--text` targets over coordinates when possible.
 
 ### Capturing Output
 
@@ -62,11 +66,33 @@ term-cli capture --session NAME --tail 10
 
 # Last N logical lines from scrollback+visible history (joins wrapped lines)
 # Use only when you need output that scrolled off-screen
+# In alternate screen (TUIs / nested tmux), this is blocked by default
 term-cli capture --session NAME --scrollback 20
+
+# Override alternate-screen protection (may return stale/misleading history)
+term-cli capture --session NAME --scrollback 20 --force
 
 # Include ANSI escape codes (colors) — works with any mode
 term-cli capture --session NAME --scrollback 10 --raw
+
+# Annotated capture — pane metadata + highlight annotations
+# Shows screen mode, bell, cursor position, and highlighted TUI elements
+# Use this when operating TUIs where you need to identify selected items
+term-cli capture --session NAME --annotate
+
+# Default capture auto-enables annotations for active alternate-screen TUIs.
+# Force plain output when needed:
+term-cli capture --session NAME --no-annotate
+
+# Optional line numbers (1-based) for visible-screen captures (not scrollback)
+term-cli capture --session NAME --annotate --line-numbers
 ```
+
+**When to use `--annotate` vs `--raw` vs plain capture:**
+- **Plain `capture`** — default for shells, REPLs, command output. Fast, clean text.
+- **`--annotate`** — for TUIs (menus, file managers, settings panels) where you need to know what's happening. Returns visible content plus an `Annotations:` section with screen mode (normal/alternate), bell alerts, cursor position (`Cursor: row,col`, 1-based), optional mouse mode (`Mouse: ...` when enabled), and highlighted rows (1-based). Bell alerts are one-shot: shown once then cleared.
+- **Auto behavior** — plain `capture` auto-enables annotations only when an active alternate-screen TUI is detected; idle shell prompts stay plain. Use `--annotate` / `--no-annotate` to override.
+- **`--raw`** — when you need exact ANSI escape codes (e.g., parsing color semantics yourself). Higher token cost.
 
 ### Waiting
 
@@ -152,8 +178,8 @@ term-cli download --session NAME /remote/data.csv - | jq .
 - **Requires Python 3 on the remote** — transfer deploys a Python helper; fails if `python3` is not available
 - **Prompt required** — session must be at a clean shell prompt; transfers fail (exit 2) if a command is running, a TUI is active, or there is partial input on the line
 - **Overwrite protection** — refuses without `--force`
-- **Fast Uplioads**
-- **Optimized Downloads** — starts fast mode, gracefully falls back to slower mode for nested ssh+tmux setups.
+- **Fast Uploads**
+- **Optimized Downloads** — starts with pipe-pane only in normal screen mode; in alternate screen mode (nested tmux/TUI), it goes directly to chunked mode for reliability.
 - **Default timeout: 120s** — set with `--timeout`
 
 ### Other Commands
@@ -222,7 +248,7 @@ term-cli download --session remote /var/log/app.log ./app.log
 - **Use long-form flags.** `--session`, `--timeout`, `--scrollback` over `-s`, `-t`, `-n`. Short forms save almost no tokens and hurt readability.
 - **Chain commands:** Fewer tool calls = less overhead, lower token usage, faster wall clock time. Use `&&` for dependent operations (`send-text --enter && wait`), `;` to always run the next command (`wait --timeout 5; capture` — see output even on timeout).
 - Remember: you can run **interactive apps** through `term-cli` (debuggers, TUIs, SSH, installers).
-- **Lost context after memory compaction?** Plain `capture` first (visible screen is usually enough). Use `--scrollback 30` if the relevant output scrolled off — scrollback is your memory.
+- **Lost context after memory compaction?** Plain `capture` first (visible screen is usually enough). Use `--scrollback 30` if relevant output scrolled off in normal screen mode. In alternate screen mode, prefer `--tail`/`--annotate`; use `--force` only when you explicitly accept potentially stale history.
 - Prefer debuggers (`pdb`/`gdb`) via `term-cli` for bug analysis; step + inspect beats print-debugging for many issues.
 - Think concurrently: start long tasks in one session and keep working; check progress with `status`, `wait`, and `capture`.
 - Use `--help` on any command for details: `term-cli run --help`
@@ -230,6 +256,7 @@ term-cli download --session remote /var/log/app.log ./app.log
 - `run --wait` already waits for prompt — don't add another `wait` after it
 - Capture before sending keys to verify screen state
 - **Unsure if a TUI is running?** `term-cli status --session NAME` shows `Screen: alternate` when a full-screen app (vim, htop, less) is active. Use `wait-idle` for alternate screen, `wait` for normal.
+- **Navigating TUIs?** Use `capture --annotate` to see screen mode, bell alerts, cursor position (`Cursor: row,col`, 1-based), and which items are highlighted. Plain `capture` loses all styling, and `--raw` costs many tokens.
 - Default `request-wait` timeout is 5 minutes — usually no need to override
 - Locked sessions (exit code 5): agent can only `capture`, `status`, `wait-*`, `request*`, `list`, `scroll`, `pipe-log`, `unpipe`. Commands `run`, `send-*`, `resize`, `kill`, `upload`, `download` are blocked
 

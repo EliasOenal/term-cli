@@ -193,7 +193,7 @@ check_prereqs() {
         py_version=$(python3 -c 'import sys; print("{}.{}.{}".format(*sys.version_info[:3]))')
         py_major=$(echo "$py_version" | cut -d. -f1)
         py_minor=$(echo "$py_version" | cut -d. -f2)
-        if [ "$py_major" -ge 3 ] && [ "$py_minor" -ge 8 ]; then
+        if [ "$py_major" -gt 3 ] || { [ "$py_major" -eq 3 ] && [ "$py_minor" -ge 8 ]; }; then
             info "python3 found ($py_version)"
         else
             err "Python 3.8+ required, found $py_version"

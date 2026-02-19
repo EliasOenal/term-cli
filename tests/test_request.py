@@ -105,12 +105,11 @@ class TestRequestWait:
     """Tests for the 'request-wait' command."""
 
     def test_request_wait_timeout_no_request(self, session, term_cli):
-        """Request-wait times out when no request was made."""
+        """Request-wait fails immediately when no request is pending."""
         result = term_cli("request-wait", "-s", session, "-t", "1")
-        # Should timeout/fail since there's no pending request to complete
-        # The behavior depends on implementation - either immediate return or timeout
-        # Let's verify it doesn't hang
-        assert True  # Just verify it completes
+        assert not result.ok
+        assert result.returncode == 2
+        assert "no pending" in result.stderr.lower()
 
     def test_request_wait_returns_immediately_when_already_completed(self, session, term_cli):
         """Request-wait fails if request was already cancelled before wait started."""
@@ -347,6 +346,82 @@ class TestResponseMessage:
         # Verify request is cleared
         status = term_cli("request-status", "-s", session)
         assert status.returncode == 1  # not pending
+
+    def test_done_without_message_clears_stale_response(
+        self,
+        session,
+        term_cli,
+        term_assist,
+        tmux_socket,
+    ):
+        """Completing without -m should clear any stale response value."""
+        # Seed stale response from a previous request.
+        subprocess.run(
+            [
+                "tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:",
+                "@term_cli_response", "stale response",
+            ],
+            capture_output=True,
+        )
+
+        term_cli("request", "-s", session, "-m", "fresh request")
+        result = term_assist("done", "-s", session)
+        assert result.ok
+
+        check = subprocess.run(
+            [
+                "tmux", "-L", tmux_socket, "show-option", "-t", f"={session}:",
+                "-qv", "@term_cli_response",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert check.stdout.strip() == ""
+
+    def test_request_wait_does_not_emit_stale_response_on_done_without_message(
+        self,
+        session,
+        term_cli,
+        term_assist,
+        tmux_socket,
+    ):
+        """A fresh request should not print an old response when done has no message."""
+        import threading
+        from conftest import TERM_CLI
+
+        # Seed stale response from a previous completed request.
+        subprocess.run(
+            [
+                "tmux", "-L", tmux_socket, "set-option", "-t", f"={session}:",
+                "@term_cli_response", "old sensitive value",
+            ],
+            capture_output=True,
+        )
+
+        term_cli("request", "-s", session, "-m", "new request")
+
+        wait_result = {"stdout": "", "stderr": "", "returncode": None}
+
+        def run_wait() -> None:
+            proc = subprocess.run(
+                [TERM_CLI, "-L", tmux_socket, "request-wait", "-s", session, "-t", "10"],
+                capture_output=True,
+                text=True,
+            )
+            wait_result["stdout"] = proc.stdout
+            wait_result["stderr"] = proc.stderr
+            wait_result["returncode"] = proc.returncode
+
+        wait_thread = threading.Thread(target=run_wait)
+        wait_thread.start()
+        time.sleep(0.5)
+
+        term_assist("done", "-s", session)
+        wait_thread.join(timeout=5)
+
+        assert wait_result["returncode"] == 0
+        assert "Request completed" in wait_result["stdout"]
+        assert "Response:" not in wait_result["stdout"]
 
 
 class TestMessageIntegrity:

@@ -48,7 +48,8 @@ tmux keys: C-c C-d C-u C-z (ctrl), Enter Escape Space Tab BSpace, Up Down Left R
 Quick reference:
   term-cli start --session NAME [--cols 80] [--rows 24] [--cwd DIR] [--locked]
   term-cli run --session NAME "cmd" [--wait] [--timeout 10]
-  term-cli capture --session NAME [--scrollback N] [--tail N]
+  term-cli capture --session NAME [--scrollback N] [--tail N] [--line-numbers] [--annotate|--no-annotate] [--force]
+  term-cli send-mouse --session NAME (--text TEXT | --x X --y Y) [--button left|right] [--scroll-up [N]|--scroll-down [N]] [--nth N] [--mouse-encoding auto|x10|utf8|sgr]
   term-cli send-key --session NAME KEY
   term-cli send-text --session NAME "text" [--enter]
   term-cli send-stdin --session NAME < file.txt
@@ -61,6 +62,7 @@ Quick reference:
   term-cli unpipe --session NAME
   term-cli upload --session NAME LOCAL_PATH [REMOTE_PATH] [--force] [--timeout SEC] [--verbose]
   term-cli download --session NAME REMOTE_PATH [LOCAL_PATH] [--force] [--timeout SEC] [--verbose]
+  term-cli scroll --session NAME LINES
   term-cli kill --session NAME [--force]
   term-cli list
 
@@ -78,7 +80,9 @@ Note: wait-for searches the entire visible screen, including the command echo li
 
 Short flags: -s (session), -w (wait), -t (timeout/tail), -x (cols), -y (rows),
              -c (cwd), -n (scrollback), -e (enter/env), -r (raw), -i (idle/ignore-case),
-             -p (print-match), -C (print-match-context), -m (message), -f (force), -l (locked)
+             -p (print-match), -C (print-match-context), -m (message), -f (force),
+             -u (scroll-up), -d (scroll-down),
+             -l (locked on start / line-numbers on capture)
 """
 
 from __future__ import annotations
@@ -95,7 +99,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -149,7 +154,30 @@ EXIT_NOT_FOUND = 127      # FileNotFoundError - missing dependency
 # Transfer defaults
 DEFAULT_TRANSFER_TIMEOUT = 120.0
 MIN_TRANSFER_COLS = 40       # Minimum terminal width for file transfers
-PIPE_CHECKPOINT_LINES = 50   # Lines between integrity checkpoints in pipe-pane download
+PIPE_CHECKPOINT_LINES = 50
+
+# ---------------------------------------------------------------------------
+# Annotation constants — 2D spatial frequency highlight detection
+# ---------------------------------------------------------------------------
+
+# Minimum RGB Euclidean distance from structural bg to count as a highlight
+ANNOTATION_PROXIMITY_DIST = 40.0
+# Minimum RGB distance for column-disruption signal
+ANNOTATION_COL_DISRUPTION_DIST = 50.0
+# Connected component minimum height (rows) to be considered structural
+ANNOTATION_STRUCTURAL_HEIGHT = 4
+# Minimum area fraction of total screen for a region to be structural
+ANNOTATION_STRUCTURAL_AREA_PCT = 0.10
+# Region must span this fraction of screen height to be structural by height alone
+ANNOTATION_STRUCTURAL_ROW_SPAN = 0.30
+# Bg key must appear on >= this fraction of rows to be globally widespread
+ANNOTATION_WIDESPREAD_ROW_PCT = 0.40
+# Bg key must cover >= this fraction of total cells to be globally widespread
+ANNOTATION_WIDESPREAD_CELL_PCT = 0.05
+# Max region height for column-disruption highlights
+ANNOTATION_MAX_DISRUPTION_HEIGHT = 3
+# Fraction of box-drawing / braille chars that marks text as decorative
+ANNOTATION_DECORATIVE_RATIO = 0.60
 
 
 class OperationTimeout(Exception):
@@ -300,6 +328,96 @@ def _get_cursor_position(session: str) -> tuple[int, int] | None:
         return (int(parts[0]), int(parts[1]))
     except (ValueError, IndexError):
         return None
+
+
+def _format_cursor_row_col(cursor: tuple[int, int]) -> str:
+    """Format tmux cursor (x,y 0-based) as display row,col 1-based."""
+    x, y = cursor
+    return f"{y + 1},{x + 1}"
+
+
+def _is_alternate_screen(session: str) -> bool:
+    """Return True when session pane is in alternate screen mode."""
+    res = _run_tmux(["display-message", "-t", _exact(session), "-p", "#{alternate_on}"])
+    return res.ok and res.stdout.strip() == "1"
+
+@dataclass
+class PaneMetadata:
+    """Pane state fetched in a single tmux query for annotated capture."""
+    cursor: tuple[int, int] | None   # (x, y) 0-based, or None on failure
+    alternate: bool                   # True when alternate screen (TUI) is active
+    bell: bool                        # True if bell was rung since last clear
+
+
+@dataclass
+class MouseMode:
+    """Mouse protocol/mode flags reported by tmux for the active pane."""
+
+    any: bool
+    standard: bool
+    button: bool
+    all_motion: bool
+    utf8: bool
+    sgr: bool
+
+    def preferred_encoding(self) -> str | None:
+        """Best encoding for this pane, or None when mouse is disabled."""
+        if not self.any:
+            return None
+        if self.sgr:
+            return "sgr"
+        if self.utf8:
+            return "utf8"
+        return "x10"
+
+    def status_string(self) -> str:
+        """Detailed one-line status string for `status` output."""
+        pref = self.preferred_encoding() or "off"
+        return (
+            f"{pref} (std={int(self.standard)} btn={int(self.button)} "
+            f"all={int(self.all_motion)} utf8={int(self.utf8)} sgr={int(self.sgr)})"
+        )
+
+
+def _get_mouse_mode(session: str) -> MouseMode | None:
+    """Read tmux mouse mode flags for the active pane."""
+    fmt = (
+        "#{mouse_any_flag}\t#{mouse_standard_flag}\t#{mouse_button_flag}\t"
+        "#{mouse_all_flag}\t#{mouse_utf8_flag}\t#{mouse_sgr_flag}"
+    )
+    res = _run_tmux(["display-message", "-t", _exact(session), "-p", fmt])
+    if not res.ok:
+        return None
+    parts = res.stdout.strip().split("\t")
+    if len(parts) != 6:
+        return None
+    return MouseMode(
+        any=parts[0] == "1",
+        standard=parts[1] == "1",
+        button=parts[2] == "1",
+        all_motion=parts[3] == "1",
+        utf8=parts[4] == "1",
+        sgr=parts[5] == "1",
+    )
+
+def _get_pane_metadata(session: str) -> PaneMetadata:
+    """Fetch cursor, screen mode, and bell flag in one tmux call."""
+    fmt = "#{cursor_x}\t#{cursor_y}\t#{alternate_on}\t#{window_bell_flag}"
+    res = _run_tmux(["display-message", "-t", _exact(session), "-p", fmt])
+    if not res.ok:
+        return PaneMetadata(cursor=None, alternate=False, bell=False)
+    try:
+        parts = res.stdout.strip().split('\t', 3)
+        cursor: tuple[int, int] | None = (int(parts[0]), int(parts[1]))
+        alternate = parts[2] == "1"
+        bell = parts[3] == "1" if len(parts) > 3 else False
+        return PaneMetadata(cursor=cursor, alternate=alternate, bell=bell)
+    except (ValueError, IndexError):
+        return PaneMetadata(cursor=None, alternate=False, bell=False)
+
+def _clear_alert_flags(session: str) -> None:
+    """Clear bell/activity/silence alert flags on the session."""
+    _run_tmux(["kill-session", "-C", "-t", _exact(session)])
 
 def _cursor_at_prompt(lines: list[str], cursor_x: int, cursor_y: int) -> bool:
     """Check if the cursor is positioned at a shell prompt.
@@ -476,6 +594,720 @@ def _wait_for_any_text(
             poll_interval = min(poll_interval * POLL_INTERVAL_MULTIPLIER, POLL_INTERVAL_MAX)
 
 
+# ---------------------------------------------------------------------------
+# Annotation utilities — 2D spatial frequency highlight detection
+# ---------------------------------------------------------------------------
+
+# Standard 8-color and bright palette for resolving basic/bright SGR codes
+_BASIC_COLORS: dict[int, tuple[int, int, int]] = {
+    0: (0, 0, 0), 1: (170, 0, 0), 2: (0, 170, 0), 3: (170, 170, 0),
+    4: (0, 0, 170), 5: (170, 0, 170), 6: (0, 170, 170), 7: (170, 170, 170),
+}
+_BRIGHT_COLORS: dict[int, tuple[int, int, int]] = {
+    0: (85, 85, 85), 1: (255, 85, 85), 2: (85, 255, 85), 3: (255, 255, 85),
+    4: (85, 85, 255), 5: (255, 85, 255), 6: (85, 255, 255), 7: (255, 255, 255),
+}
+_BASIC_NAMES: dict[int, str] = {
+    0: "black", 1: "red", 2: "green", 3: "yellow",
+    4: "blue", 5: "magenta", 6: "cyan", 7: "white",
+}
+
+# Box-drawing, block elements, and braille characters
+_DECORATIVE_CODEPOINTS = frozenset(range(0x2500, 0x25A0)) | frozenset(range(0x2800, 0x2900))
+# ASCII punctuation often mixed with box-drawing in title bars
+_BORDER_PUNCT = frozenset("<>[]{}() .^+-|")
+
+# Regex matching only SGR sequences (ESC [ params m)
+_ANSI_SGR_RE = re.compile(r"\033\[([0-9;]*)m")
+# Regex matching all non-SGR escape sequences (CSI non-m, OSC, charset select)
+_ANSI_OTHER_RE = re.compile(
+    r"\033\[[0-9;?]*[A-LN-Za-ln-z]"        # CSI sequences except 'm'
+    r"|\033\][^\x07\033]*(?:\x07|\033\\)"   # OSC sequences
+    r"|\033[()][0-9A-Z]"                    # Charset selection
+)
+
+# Assumed terminal defaults.  Used when no explicit colour has been set.
+_DEFAULT_FG = (255, 255, 255)
+_DEFAULT_BG = (0, 0, 0)
+
+
+def _color_256_to_rgb(idx: int) -> tuple[int, int, int] | None:
+    """Convert 256-color palette index to RGB. Returns None for invalid."""
+    if idx < 0 or idx > 255:
+        return None
+    if idx < 8:
+        return _BASIC_COLORS[idx]
+    if idx < 16:
+        return _BRIGHT_COLORS[idx - 8]
+    if idx < 232:
+        # 6x6x6 xterm color cube: indices 16-231
+        idx -= 16
+        b_idx = idx % 6
+        g_idx = (idx // 6) % 6
+        r_idx = idx // 36
+
+        def cube(v: int) -> int:
+            # xterm cube levels are 0,95,135,175,215,255
+            return 0 if v == 0 else 55 + 40 * v
+
+        return (cube(r_idx), cube(g_idx), cube(b_idx))
+    # Grayscale ramp: indices 232-255
+    v = 8 + (idx - 232) * 10
+    return (v, v, v)
+
+
+def _safe_sgr_int(s: str) -> int:
+    """Parse int from SGR param, treating empty/invalid as 0."""
+    if not s:
+        return 0
+    try:
+        return int(s)
+    except ValueError:
+        return 0
+
+
+def _safe_rgb(params: list[str], offset: int) -> tuple[int, int, int] | None:
+    """Parse R;G;B from params at *offset*, clamping to 0-255."""
+    try:
+        r = max(0, min(255, int(params[offset])))
+        g = max(0, min(255, int(params[offset + 1])))
+        b = max(0, min(255, int(params[offset + 2])))
+        return (r, g, b)
+    except (ValueError, IndexError):
+        return None
+
+
+def _resolve_colors(
+    reverse: bool,
+    fg_rgb: tuple[int, int, int] | None,
+    fg_basic: int | None,
+    bg_rgb: tuple[int, int, int] | None,
+    bg_basic: int | None,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """Resolve effective (fg, bg) colours to concrete RGB values.
+
+    Applies reverse-video swap and fills in terminal defaults so callers
+    always receive two concrete RGB tuples.
+    """
+    fg: tuple[int, int, int]
+    if fg_rgb is not None:
+        fg = fg_rgb
+    elif fg_basic is not None:
+        fg = _BASIC_COLORS.get(fg_basic, _DEFAULT_FG)
+    else:
+        fg = _DEFAULT_FG
+
+    bg: tuple[int, int, int]
+    if bg_rgb is not None:
+        bg = bg_rgb
+    elif bg_basic is not None:
+        bg = _BASIC_COLORS.get(bg_basic, _DEFAULT_BG)
+    else:
+        bg = _DEFAULT_BG
+
+    if reverse:
+        fg, bg = bg, fg
+    return fg, bg
+
+
+def _parse_raw_screen(raw_text: str) -> list[list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]]]:
+    """Parse raw ANSI text into per-row lists of styled segments.
+
+    Each segment is ``(text, fg_rgb, bg_rgb, bold)`` with fully resolved
+    concrete RGB values.  Reverse video is resolved at parse time — the
+    fg and bg colours are swapped so downstream code never needs to reason
+    about reverse state.  Terminal defaults are filled in as ``_DEFAULT_FG``
+    and ``_DEFAULT_BG``.
+
+    Every row is padded to the full terminal width (determined by the widest
+    row in the capture).  Padding cells use the active fg/bg/bold state at
+    end of line — matching real terminal behaviour where the erase colour
+    fills to the right margin.
+
+    ANSI state (fg, bg, bold, reverse) carries across line boundaries —
+    tmux ``capture-pane -p -e`` emits a continuous stream where a color
+    set on one row persists until explicitly changed or reset.
+    """
+    raw_text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # First pass: parse segments and record trailing style per row.
+    # Each entry: (segments, char_count, (trail_fg, trail_bg, trail_bold))
+    parsed: list[
+        tuple[
+            list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]],
+            int,
+            tuple[tuple[int, int, int], tuple[int, int, int], bool],
+        ]
+    ] = []
+
+    fg_rgb: tuple[int, int, int] | None = None
+    bg_rgb: tuple[int, int, int] | None = None
+    fg_basic: int | None = None
+    bg_basic: int | None = None
+    bold = False
+    reverse = False
+
+    max_cols = 0
+
+    for line in raw_text.split("\n"):
+        line = _ANSI_OTHER_RE.sub("", line)
+        segments: list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]] = []
+        char_count = 0
+        pos = 0
+
+        for m in _ANSI_SGR_RE.finditer(line):
+            text = line[pos:m.start()]
+            if text:
+                fg, bg = _resolve_colors(reverse, fg_rgb, fg_basic, bg_rgb, bg_basic)
+                segments.append((text, fg, bg, bold))
+                char_count += len(text)
+            pos = m.end()
+
+            params = m.group(1).split(";") if m.group(1) else ["0"]
+            j = 0
+            while j < len(params):
+                p = _safe_sgr_int(params[j])
+                if p == 0:
+                    fg_rgb = bg_rgb = None
+                    fg_basic = bg_basic = None
+                    bold = reverse = False
+                elif p == 1:
+                    bold = True
+                elif p == 7:
+                    reverse = True
+                elif p == 22:
+                    bold = False
+                elif p == 27:
+                    reverse = False
+                elif 30 <= p <= 37:
+                    fg_basic = p - 30
+                    fg_rgb = None
+                elif 90 <= p <= 97:
+                    fg_basic = p - 90
+                    fg_rgb = _BRIGHT_COLORS.get(p - 90)
+                elif p == 38:
+                    if (j + 1 < len(params) and params[j + 1] == "2"
+                            and j + 4 < len(params)):
+                        rgb = _safe_rgb(params, j + 2)
+                        if rgb:
+                            fg_rgb = rgb
+                            fg_basic = None
+                        j += 4
+                    elif (j + 1 < len(params) and params[j + 1] == "5"
+                          and j + 2 < len(params)):
+                        idx = _safe_sgr_int(params[j + 2])
+                        c = _color_256_to_rgb(idx)
+                        if c:
+                            fg_rgb = c
+                            fg_basic = None
+                        j += 2
+                elif p == 39:
+                    fg_rgb = None
+                    fg_basic = None
+                elif 40 <= p <= 47:
+                    bg_basic = p - 40
+                    bg_rgb = None
+                elif 100 <= p <= 107:
+                    bg_basic = p - 100
+                    bg_rgb = _BRIGHT_COLORS.get(p - 100)
+                elif p == 48:
+                    if (j + 1 < len(params) and params[j + 1] == "2"
+                            and j + 4 < len(params)):
+                        rgb = _safe_rgb(params, j + 2)
+                        if rgb:
+                            bg_rgb = rgb
+                            bg_basic = None
+                        j += 4
+                    elif (j + 1 < len(params) and params[j + 1] == "5"
+                          and j + 2 < len(params)):
+                        idx = _safe_sgr_int(params[j + 2])
+                        c = _color_256_to_rgb(idx)
+                        if c:
+                            bg_rgb = c
+                            bg_basic = None
+                        j += 2
+                elif p == 49:
+                    bg_rgb = None
+                    bg_basic = None
+                j += 1
+
+        text = line[pos:]
+        if text:
+            fg, bg = _resolve_colors(reverse, fg_rgb, fg_basic, bg_rgb, bg_basic)
+            segments.append((text, fg, bg, bold))
+            char_count += len(text)
+
+        # Record the resolved style at end of line for padding.
+        trail_fg, trail_bg = _resolve_colors(
+            reverse, fg_rgb, fg_basic, bg_rgb, bg_basic,
+        )
+        parsed.append((segments, char_count, (trail_fg, trail_bg, bold)))
+        if char_count > max_cols:
+            max_cols = char_count
+
+    # Second pass: pad each row to full terminal width.
+    all_rows: list[list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]]] = []
+    for segments, char_count, (t_fg, t_bg, t_bold) in parsed:
+        pad = max_cols - char_count
+        if pad > 0:
+            segments.append((" " * pad, t_fg, t_bg, t_bold))
+        all_rows.append(segments)
+
+    return all_rows
+
+
+def _color_label(bg_rgb: tuple[int, int, int]) -> str:
+    """Human-readable color label for annotations."""
+    for idx, c in _BASIC_COLORS.items():
+        if bg_rgb == c:
+            return f"bg:{_BASIC_NAMES[idx]}"
+    for idx, c in _BRIGHT_COLORS.items():
+        if bg_rgb == c:
+            return f"bg:bright-{_BASIC_NAMES[idx]}"
+    return f"bg:rgb({bg_rgb[0]},{bg_rgb[1]},{bg_rgb[2]})"
+
+
+def _color_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    """Euclidean distance in RGB space."""
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+
+def _is_decorative_text(text: str) -> bool:
+    """True if text is purely box-drawing, block elements, or braille."""
+    return bool(text) and all(ord(c) in _DECORATIVE_CODEPOINTS or c == " " for c in text)
+
+
+def _is_panel_chrome(text: str) -> bool:
+    """True if text looks like panel border/title chrome (mostly box-drawing)."""
+    if _is_decorative_text(text):
+        return True
+    chrome = sum(1 for c in text if ord(c) in _DECORATIVE_CODEPOINTS or c in _BORDER_PUNCT)
+    return len(text) > 0 and chrome / len(text) > ANNOTATION_DECORATIVE_RATIO
+
+
+@dataclass
+class _AnnotationRegion:
+    """Connected component of same-bg cells in the screen grid."""
+
+    bg_key: tuple[int, int, int]
+    cells: set[tuple[int, int]] = field(default_factory=set)
+    min_row: int = sys.maxsize
+    max_row: int = -1
+    min_col: int = sys.maxsize
+    max_col: int = -1
+
+    def add(self, r: int, c: int) -> None:
+        self.cells.add((r, c))
+        self.min_row = min(self.min_row, r)
+        self.max_row = max(self.max_row, r)
+        self.min_col = min(self.min_col, c)
+        self.max_col = max(self.max_col, c)
+
+    @property
+    def height(self) -> int:
+        return self.max_row - self.min_row + 1
+
+    @property
+    def width(self) -> int:
+        return self.max_col - self.min_col + 1
+
+    @property
+    def area(self) -> int:
+        return len(self.cells)
+
+
+def _build_bg_grid(
+    all_rows: list[list[tuple[str, tuple[int, int, int], tuple[int, int, int], bool]]],
+) -> tuple[list[list[tuple[int, int, int]]], int, int]:
+    """Expand parsed segments into a per-cell 2D grid of bg colors.
+
+    Rows are expected to be pre-padded to full terminal width by the parser.
+    """
+    expanded: list[list[tuple[int, int, int]]] = []
+    max_cols = 0
+    for row_segs in all_rows:
+        row: list[tuple[int, int, int]] = []
+        for text, _fg, bg, _bold in row_segs:
+            row.extend(bg for _ in text)
+        expanded.append(row)
+        max_cols = max(max_cols, len(row))
+    return expanded, len(expanded), max_cols
+
+
+def _flood_fill_regions(
+    grid: list[list[tuple[int, int, int]]], num_rows: int, num_cols: int,
+) -> list[_AnnotationRegion]:
+    """4-connected flood-fill to find regions of identical bg."""
+    visited = [[False] * num_cols for _ in range(num_rows)]
+    regions: list[_AnnotationRegion] = []
+    for r in range(num_rows):
+        for c in range(num_cols):
+            if visited[r][c]:
+                continue
+            key = grid[r][c]
+            region = _AnnotationRegion(bg_key=key)
+            stack = [(r, c)]
+            visited[r][c] = True
+            while stack:
+                cr, cc = stack.pop()
+                region.add(cr, cc)
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = cr + dr, cc + dc
+                    if 0 <= nr < num_rows and 0 <= nc < num_cols:
+                        if not visited[nr][nc] and grid[nr][nc] == key:
+                            visited[nr][nc] = True
+                            stack.append((nr, nc))
+            regions.append(region)
+    return regions
+
+
+def _column_dominant_bg(
+    grid: list[list[tuple[int, int, int]]], num_rows: int, num_cols: int,
+) -> list[tuple[int, int, int]]:
+    """Per-column most-frequent bg color."""
+    dominants: list[tuple[int, int, int]] = []
+    for c in range(num_cols):
+        freq: dict[tuple[int, int, int], int] = {}
+        for r in range(num_rows):
+            key = grid[r][c]
+            freq[key] = freq.get(key, 0) + 1
+        dominants.append(max(freq, key=lambda k: freq[k]))
+    return dominants
+
+
+def _row_disruption_runs(
+    grid: list[list[tuple[int, int, int]]], num_rows: int, num_cols: int,
+    col_dominant: list[tuple[int, int, int]],
+) -> list[list[tuple[int, int, tuple[int, int, int]]]]:
+    """Per-row contiguous runs of cells differing from their column dominant.
+
+    Returns for each row a list of (start_col, end_col, bg_color) tuples.
+    """
+    all_runs: list[list[tuple[int, int, tuple[int, int, int]]]] = []
+    for r in range(num_rows):
+        runs: list[tuple[int, int, tuple[int, int, int]]] = []
+        run_start: int | None = None
+        run_key: tuple[int, int, int] | None = None
+        for c in range(num_cols):
+            cur = grid[r][c]
+            is_disrupted = cur != col_dominant[c]
+            if is_disrupted:
+                if run_start is None:
+                    run_start = c
+                    run_key = cur
+                elif cur != run_key:
+                    assert run_key is not None
+                    runs.append((run_start, c - 1, run_key))
+                    run_start = c
+                    run_key = cur
+            else:
+                if run_start is not None:
+                    assert run_key is not None
+                    runs.append((run_start, c - 1, run_key))
+                    run_start = None
+                    run_key = None
+        if run_start is not None:
+            assert run_key is not None
+            runs.append((run_start, num_cols - 1, run_key))
+        all_runs.append(runs)
+    return all_runs
+
+
+def _annotate_raw(raw_text: str) -> list[tuple[int, str, str]]:
+    """Analyse raw ANSI capture and return highlight annotations.
+
+    Uses 2D spatial frequency analysis: large connected regions of the same
+    background colour are structural (panels, chrome); small/short regions
+    that disrupt vertical continuity are highlights (selected items, active
+    elements, status bars).
+
+    Returns a list of (0-based_row, text_preview, color_label) tuples.
+    """
+    all_rows = _parse_raw_screen(raw_text)
+    grid, num_rows, num_cols = _build_bg_grid(all_rows)
+    if num_rows == 0 or num_cols == 0:
+        return []
+
+    total_cells = num_rows * num_cols
+
+    # --- Connected component analysis ---
+    regions = _flood_fill_regions(grid, num_rows, num_cols)
+    region_at: list[list[int]] = [[-1] * num_cols for _ in range(num_rows)]
+    for idx, reg in enumerate(regions):
+        for r, c in reg.cells:
+            region_at[r][c] = idx
+
+    # --- Global bg statistics ---
+    bg_row_coverage: dict[tuple[int, int, int], set[int]] = defaultdict(set)
+    bg_total_cells: dict[tuple[int, int, int], int] = defaultdict(int)
+    for r in range(num_rows):
+        for c in range(num_cols):
+            key = grid[r][c]
+            bg_row_coverage[key].add(r)
+            bg_total_cells[key] += 1
+
+    # --- Classify structural regions ---
+    structural_ids: set[int] = set()
+    for idx, reg in enumerate(regions):
+        if reg.bg_key == _DEFAULT_BG:
+            structural_ids.add(idx)
+            continue
+        frac = reg.area / total_cells
+        if frac >= ANNOTATION_STRUCTURAL_AREA_PCT and reg.height >= ANNOTATION_STRUCTURAL_HEIGHT:
+            structural_ids.add(idx)
+        elif reg.height >= num_rows * ANNOTATION_STRUCTURAL_ROW_SPAN:
+            structural_ids.add(idx)
+
+    structural_keys: set[tuple[int, int, int]] = {_DEFAULT_BG}
+    for idx in structural_ids:
+        structural_keys.add(regions[idx].bg_key)
+
+    # Globally widespread keys (fragmented by grid lines into many small regions)
+    for key, rows_set in bg_row_coverage.items():
+        row_pct = len(rows_set) / num_rows
+        cell_pct = bg_total_cells[key] / total_cells
+        if row_pct >= ANNOTATION_WIDESPREAD_ROW_PCT and cell_pct >= ANNOTATION_WIDESPREAD_CELL_PCT:
+            structural_keys.add(key)
+
+    # --- Spatial metrics ---
+    col_dominant = _column_dominant_bg(grid, num_rows, num_cols)
+    disruption_runs = _row_disruption_runs(grid, num_rows, num_cols, col_dominant)
+
+    # --- Row text extraction helper ---
+    def _row_text_by_bg(r: int) -> dict[tuple[int, int, int], list[str]]:
+        """Extract text segments by bg colour for a row.
+
+        Returns a list of separate text pieces per bg colour.  Segments
+        separated by other-bg regions become separate list entries so the
+        caller can distinguish connected text from disjoint labels.
+        """
+        # Build (col_start, text, bg) list
+        entries: list[tuple[int, str, tuple[int, int, int]]] = []
+        col = 0
+        for text, _fg, bg, _bold in all_rows[r]:
+            entries.append((col, text, bg))
+            col += len(text)
+
+        # Group contiguous text per bg; a spatial gap starts a new segment.
+        segments: dict[tuple[int, int, int], list[list[str]]] = defaultdict(lambda: [[]])
+        prev_end: dict[tuple[int, int, int], int] = {}
+        for col_start, text, bg in entries:
+            if bg in prev_end and col_start > prev_end[bg]:
+                # Gap — start a new segment for this bg
+                segments[bg].append([])
+            segments[bg][-1].append(text)
+            prev_end[bg] = col_start + len(text)
+
+        result: dict[tuple[int, int, int], list[str]] = {}
+        for k, seg_groups in segments.items():
+            pieces = [re.sub(r"  +", " ", "".join(g)).strip() for g in seg_groups]
+            pieces = [p for p in pieces if p]
+            if pieces:
+                result[k] = pieces
+        return result
+
+    # === SIGNAL A: non-structural bg content ===
+    # All signals run independently.  Results are deduplicated at the end:
+    # when multiple signals report the same (row, bg_label), the entry with
+    # the longest text wins (Signal C's combined bar text > Signal B's
+    # single element, for example).
+    results: list[tuple[int, str, str]] = []
+    seen_a: set[int] = set()
+
+    for r in range(num_rows):
+        row_text_map = _row_text_by_bg(r)
+        for key, pieces in row_text_map.items():
+            if key in structural_keys:
+                continue
+
+            # Proximity filter
+            if any(_color_distance(key, s) < ANNOTATION_PROXIMITY_DIST
+                   for s in structural_keys):
+                continue
+
+            # Join pieces for quality checks
+            joined = ", ".join(pieces) if len(pieces) > 1 else pieces[0]
+
+            if _is_decorative_text(joined):
+                continue
+            if len(joined.replace(" ", "").replace(",", "")) < 3:
+                continue
+
+            # Region shape: all tall regions = structural
+            row_reg_ids = {region_at[r][c] for c in range(num_cols) if grid[r][c] == key}
+            if all(regions[ri].height >= ANNOTATION_STRUCTURAL_HEIGHT for ri in row_reg_ids):
+                continue
+
+            seen_a.add(r)
+            label = _color_label(key)
+            results.append((r, joined, label))
+
+    # === SIGNAL B: column-disruption highlights ===
+    for r in range(num_rows):
+        if r in seen_a:
+            continue
+
+        # Default-bg runs that collectively span most of the row are content
+        # areas (shell prompts, hint text), not highlights.  Only short
+        # default-bg disruptions (selected menu items inside coloured panels)
+        # are interesting.
+        default_disruption_total = sum(
+            e - s + 1
+            for s, e, k in disruption_runs[r]
+            if k == _DEFAULT_BG
+        )
+        skip_default = default_disruption_total > num_cols // 2
+
+        for run_start, run_end, run_key in disruption_runs[r]:
+            run_width = run_end - run_start + 1
+            if run_width < 3:
+                continue
+            if run_key == _DEFAULT_BG and skip_default:
+                continue
+
+            # Require meaningful colour contrast with column dominants
+            col_doms = {col_dominant[c] for c in range(run_start, run_end + 1)}
+            min_contrast = min(
+                _color_distance(run_key, d)
+                for d in col_doms
+            )
+            if min_contrast < ANNOTATION_COL_DISRUPTION_DIST:
+                continue
+
+            # Extract text in this run
+            run_chars: list[str] = []
+            col_pos = 0
+            for seg_text, _seg_fg, seg_bg, _bold in all_rows[r]:
+                for ch in seg_text:
+                    if run_start <= col_pos <= run_end and seg_bg == run_key:
+                        run_chars.append(ch)
+                    col_pos += 1
+            text = "".join(run_chars).strip()
+
+            if _is_panel_chrome(text):
+                continue
+            if len(text.replace(" ", "")) < 3:
+                continue
+
+            # Region shape: cells in run must belong to short regions
+            run_reg_ids = {region_at[r][c] for c in range(run_start, run_end + 1)
+                           if grid[r][c] == run_key}
+            if not run_reg_ids:
+                continue
+            if max(regions[ri].height for ri in run_reg_ids) > ANNOTATION_MAX_DISRUPTION_HEIGHT:
+                continue
+
+            results.append((r, text, _color_label(run_key)))
+            break  # one result per row
+
+    # === SIGNAL C: high-frequency bg transitions (short flanked runs) ===
+    # A short run of one bg colour flanked by longer runs of a different bg
+    # is a spatial-frequency spike — typically a selected button, active tab,
+    # or focused element that stands out from its local surroundings.
+    # When a row has multiple qualifying runs of the same colour (e.g. a
+    # shortcut bar like mc's F-key row), they are combined into one annotation.
+    for r in range(num_rows):
+        # Build same-bg runs for this row
+        row_runs: list[tuple[int, int, tuple[int, int, int]]] = []
+        cur_key = grid[r][0]
+        run_s = 0
+        for c in range(1, num_cols):
+            if grid[r][c] != cur_key:
+                row_runs.append((run_s, c - 1, cur_key))
+                cur_key = grid[r][c]
+                run_s = c
+        row_runs.append((run_s, num_cols - 1, cur_key))
+
+        # Detect repeating bar pattern: >=6 runs alternating between exactly
+        # 2 colours (e.g. mc's F-key row: 2-wide black / 6-wide cyan x10).
+        # In this pattern the narrow separator runs are legitimate flanks so
+        # we skip the minimum-flank-width gate.
+        is_bar = False
+        if len(row_runs) >= 6:
+            bar_colors: set[tuple[int, int, int]] = set()
+            alternating = True
+            for bi in range(len(row_runs)):
+                bar_colors.add(row_runs[bi][2])
+                if bi > 0 and row_runs[bi][2] == row_runs[bi - 1][2]:
+                    alternating = False
+                    break
+            is_bar = alternating and len(bar_colors) == 2
+
+        # Collect all qualifying runs, grouped by bg colour.
+        hits: dict[tuple[int, int, int], list[str]] = defaultdict(list)
+        # For bar patterns, include edge runs (first/last) — they only
+        # have one neighbour but the repeating pattern is sufficient context.
+        scan_start = 0 if is_bar else 1
+        scan_end = len(row_runs) if is_bar else len(row_runs) - 1
+        for i in range(scan_start, scan_end):
+            s, e, k = row_runs[i]
+            width = e - s + 1
+            if width > 15:
+                continue
+            # Edge runs in bar mode: check the single neighbour only
+            if i == 0:
+                left_key = k  # no left neighbour — treat as same (skip check)
+                right_key = row_runs[i + 1][2]
+            elif i == len(row_runs) - 1:
+                left_key = row_runs[i - 1][2]
+                right_key = k  # no right neighbour
+            else:
+                left_key = row_runs[i - 1][2]
+                right_key = row_runs[i + 1][2]
+            if left_key == k and right_key == k:
+                continue
+            # For non-edge interior runs: both flanks must differ
+            if 0 < i < len(row_runs) - 1:
+                if left_key == k or right_key == k:
+                    continue
+            if not is_bar:
+                left_w = row_runs[i - 1][1] - row_runs[i - 1][0] + 1
+                right_w = row_runs[i + 1][1] - row_runs[i + 1][0] + 1
+                if left_w < 3 or right_w < 3:
+                    continue
+
+            # Require meaningful colour contrast with at least one neighbour
+            dist_left = _color_distance(k, left_key)
+            dist_right = _color_distance(k, right_key)
+            if max(dist_left, dist_right) < ANNOTATION_PROXIMITY_DIST:
+                continue
+
+            # Extract text in this run
+            col_pos = 0
+            run_chars: list[str] = []
+            for seg_text, _seg_fg, _seg_bg, _bold in all_rows[r]:
+                for ch in seg_text:
+                    if s <= col_pos <= e:
+                        run_chars.append(ch)
+                    col_pos += 1
+            text = "".join(run_chars).strip()
+            # In bar mode, single-char runs are meaningful (hotkey numbers);
+            # outside bar mode, require >=3 non-space chars to filter noise.
+            min_len = 1 if is_bar else 3
+            if len(text.replace(" ", "")) < min_len:
+                continue
+            if _is_decorative_text(text):
+                continue
+
+            hits[k].append(text)
+
+        # Emit one annotation per qualifying bg colour on this row.
+        for k, texts in hits.items():
+            combined = ", ".join(texts) if len(texts) > 1 else texts[0]
+            results.append((r, combined, _color_label(k)))
+
+    # --- Deduplicate: when multiple signals report the same (row, label),
+    # keep the entry with the longest text (richer context). ---
+    best: dict[tuple[int, str], tuple[int, str, str]] = {}
+    for entry in results:
+        row_num, text, label = entry
+        key = (row_num, label)
+        if key not in best or len(text) > len(best[key][1]):
+            best[key] = entry
+    results = sorted(best.values())
+    return results
+
+
 # ----------------------------
 # Transfer utilities
 # ----------------------------
@@ -488,6 +1320,50 @@ _B64_LINE_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
 def _strip_ansi(text: str) -> str:
     """Remove ANSI escape sequences from *text*."""
     return _ANSI_RE.sub("", text)
+
+
+def _test_hooks_enabled() -> bool:
+    """Return True when internal transfer test hooks are enabled."""
+    return os.environ.get("TERM_CLI_TEST_HOOKS") == "1"
+
+
+def _inject_pipe_payload_fault(payload: str) -> str:
+    """Optionally mutate pipe-pane payload for deterministic test fault injection.
+
+    This is intentionally private and env-gated for tests.  No CLI flags/docs.
+
+    Supported when ``TERM_CLI_TEST_HOOKS=1``:
+    - ``TERM_CLI_TEST_PIPE_DROP_BLOCK=<start>:<count>``
+      Drops ``count`` base64 lines starting at 0-based index ``start``.
+    """
+    if not _test_hooks_enabled():
+        return payload
+
+    spec = os.environ.get("TERM_CLI_TEST_PIPE_DROP_BLOCK", "").strip()
+    if not spec:
+        return payload
+
+    try:
+        start_s, count_s = spec.split(":", 1)
+        start = int(start_s)
+        count = int(count_s)
+    except ValueError:
+        return payload
+
+    if start < 0 or count <= 0:
+        return payload
+
+    out_lines: list[str] = []
+    b64_idx = 0
+    end = start + count
+    for line in payload.splitlines():
+        if _B64_LINE_RE.match(line):
+            if start <= b64_idx < end:
+                b64_idx += 1
+                continue
+            b64_idx += 1
+        out_lines.append(line)
+    return "\n".join(out_lines)
 
 
 def _format_size(nbytes: int) -> str:
@@ -865,6 +1741,36 @@ def _remote_exec(session: str, cmd: str, timeout: float) -> str:
     return _capture_screen(session, trim=True, join_wrapped=True)
 
 
+def _remote_exec_until_marker(
+    session: str,
+    cmd: str,
+    done_marker: str,
+    timeout: float,
+) -> str:
+    """Run *cmd*, wait for *done_marker* and prompt, then capture screen.
+
+    This is more deterministic than prompt-only waits for short probe commands
+    in nested tmux/SSH sessions where prompt detection can briefly match stale
+    state before the command output is fully rendered.
+    """
+    start = time.time()
+    _send_cmd(session, cmd)
+
+    matched, _ = _wait_for_any_text(session, [done_marker], timeout)
+    if matched is None:
+        raise OperationTimeout(
+            f"remote command marker not seen within {timeout}s: {done_marker}"
+        )
+
+    elapsed = time.time() - start
+    remaining = max(0.1, timeout - elapsed)
+    success, _ = _wait_for_prompt(session, remaining)
+    if not success:
+        raise OperationTimeout(f"remote command did not complete within {timeout}s: {cmd}")
+
+    return _capture_screen(session, trim=True, join_wrapped=True)
+
+
 def _dismiss_helper(session: str) -> None:
     """Send 'q' to dismiss a remote helper blocking on _wait_for_dismiss().
 
@@ -1069,21 +1975,31 @@ def _probe_python(session: str, timeout: float) -> str:
     Returns the binary name (``"python3"`` or ``"python"``).
     Raises RuntimeError if neither is found.
     """
+    probe_id = f"{os.getpid()}_{int(time.time() * 1000) & 0xFFFFFF}"
+    done_marker = f"TC_PY_DONE_{probe_id}"
     cmd = (
-        "python3 -c \"import sys; print('TC_PY3_%d.%d' % sys.version_info[:2])\" 2>/dev/null; "
-        "python -c \"import sys; print('TC_PYBIN_%d.%d' % sys.version_info[:2])\" 2>/dev/null; "
-        "printf 'TC_PY_DONE\\n'"
+        f"python3 -c \"print('TC_PY3_{probe_id}_OK'); print('TC_PY3_{probe_id}_OK')\" 2>/dev/null; "
+        f"python -c \"import sys; print('TC_PYBIN_{probe_id}_%d' % sys.version_info[0]); "
+        f"print('TC_PYBIN_{probe_id}_%d' % sys.version_info[0])\" 2>/dev/null; "
+        f"printf '{done_marker}\\n'"
     )
-    screen = _remote_exec(session, cmd, timeout)
-    lines = [ln.strip() for ln in screen.splitlines()]
-    for ln in lines:
-        if ln.startswith("TC_PY3_"):
-            return "python3"
-    for ln in lines:
-        if ln.startswith("TC_PYBIN_"):
-            # Only accept Python 3.x running as 'python'
-            if ln.startswith("TC_PYBIN_3."):
-                return "python"
+    screen = _remote_exec_until_marker(session, cmd, done_marker, timeout)
+
+    py3_re = re.compile(
+        rf"(?:^|\s)TC_PY3_{re.escape(probe_id)}_OK(?:\s|$)",
+        re.MULTILINE,
+    )
+    if py3_re.search(screen):
+        return "python3"
+
+    m = re.search(
+        rf"(?:^|\s)TC_PYBIN_{re.escape(probe_id)}_(\d+)(?:\s|$)",
+        screen,
+        re.MULTILINE,
+    )
+    if m and m.group(1) == "3":
+        return "python"
+
     raise RuntimeError(
         "Python 3 is not available on the remote host.  "
         "Install python3 to enable file transfers."
@@ -1168,10 +2084,20 @@ def _remote_file_exists(session: str, path: str, timeout: float) -> bool:
     Uses ``test -f`` with a unique per-invocation marker to avoid false
     positives from stale output still visible on the terminal screen.
     """
-    marker = f"TC_FE_{os.getpid()}_{int(time.time() * 1000) & 0xFFFFFF}"
-    cmd = f"test -f {shlex.quote(path)}; printf '{marker}_%d\\n' \"$?\""
-    screen = _remote_exec(session, cmd, timeout)
-    return f"{marker}_0" in screen
+    marker = f"{os.getpid()}_{int(time.time() * 1000) & 0xFFFFFF}"
+    done_marker = f"TC_FE_DONE_{marker}"
+    cmd = (
+        f"test -f {shlex.quote(path)}; rc=$?; "
+        f"printf 'TC_FE_{marker}_%d\\nTC_FE_{marker}_%d\\n' \"$rc\" \"$rc\"; "
+        f"printf '{done_marker}\\n'"
+    )
+    screen = _remote_exec_until_marker(session, cmd, done_marker, timeout)
+    m = re.search(
+        rf"(?:^|\s)TC_FE_{re.escape(marker)}_([01])\s*$",
+        screen,
+        re.MULTILINE,
+    )
+    return bool(m and m.group(1) == "0")
 
 
 def _get_dl_strategy(session: str) -> str | None:
@@ -1256,6 +2182,7 @@ def _download_pipe(
         return None
 
     payload = raw[begin_idx + len("TC_DL_BEGIN\n"):end_idx]
+    payload = _inject_pipe_payload_fault(payload)
 
     # Extract TC_DONE sha256 from after TC_DL_END
     remote_sha: str | None = None
@@ -1380,12 +2307,13 @@ def _download_chunked(
 
     # Use regex to handle line wrapping on narrow terminals.
     screen = _capture_screen(session, trim=True)
-    total_b64_lines = 0
-    remote_sha = ""
     m = re.search(r"TC_DL_INFO\s+(\d+)\s+([0-9a-f]{64})", screen)
-    if m:
-        total_b64_lines = int(m.group(1))
-        remote_sha = m.group(2)
+    if not m:
+        # Parsing failure is not an empty file; treat as corruption so callers
+        # can surface/fallback instead of silently returning b"".
+        raise RuntimeError("chunked download: could not parse TC_DL_INFO marker")
+    total_b64_lines = int(m.group(1))
+    remote_sha = m.group(2)
 
     if total_b64_lines == 0:
         # Empty file — dismiss helper and return
@@ -1658,6 +2586,173 @@ def cmd_send_key(args: argparse.Namespace) -> None:
         raise RuntimeError(res.stderr.strip() or "Failed to send key")
 
 
+def _find_text_matches(screen: str, needle: str) -> list[tuple[int, int, int]]:
+    """Find all text matches as (row, col_start, col_end), 0-based."""
+    matches: list[tuple[int, int, int]] = []
+    for row, line in enumerate(screen.split("\n")):
+        start = 0
+        while True:
+            idx = line.find(needle, start)
+            if idx < 0:
+                break
+            matches.append((row, idx, idx + len(needle) - 1))
+            start = idx + 1
+    return matches
+
+
+def _mouse_x10(button_code: int, x: int, y: int, release: bool = False) -> str:
+    """Build an X10 mouse sequence for 0-based coordinates.
+
+    tmux `send-keys -l` is more reliable with X10 byte packets than SGR text
+    sequences for several ncurses TUIs (notably htop through SSH).
+    """
+    cb = 35 if release else button_code + 32
+    cx = x + 33
+    cy = y + 33
+    if cx > 255 or cy > 255:
+        raise ValueError(
+            f"Mouse coordinates out of X10 range: x={x}, y={y}; "
+            "max supported is 222"
+        )
+    return bytes((0x1B, 0x5B, 0x4D, cb, cx, cy)).decode("latin1")
+
+
+def _mouse_utf8(button_code: int, x: int, y: int, release: bool = False) -> str:
+    """Build a UTF-8 mouse sequence (xterm 1005) for 0-based coordinates."""
+    cb = 35 if release else button_code + 32
+    cx = x + 33
+    cy = y + 33
+    return b"\x1b[M".decode("latin1") + chr(cb) + chr(cx) + chr(cy)
+
+
+def _mouse_sgr(button_code: int, x: int, y: int, release: bool = False) -> str:
+    """Build an SGR mouse sequence (xterm 1006) for 0-based coordinates."""
+    suffix = "m" if release else "M"
+    return f"\x1b[<{button_code};{x + 1};{y + 1}{suffix}"
+
+
+def _mouse_packet(encoding: str, button_code: int, x: int, y: int, release: bool) -> str:
+    """Build a mouse packet in the selected encoding."""
+    if encoding == "x10":
+        return _mouse_x10(button_code, x, y, release=release)
+    if encoding == "utf8":
+        return _mouse_utf8(button_code, x, y, release=release)
+    if encoding == "sgr":
+        return _mouse_sgr(button_code, x, y, release=release)
+    raise ValueError(f"Unsupported mouse encoding: {encoding}")
+
+
+def _send_mouse_sequence(session: str, seq: str) -> None:
+    """Send a literal mouse escape sequence to the pane."""
+    res = _run_tmux(["send-keys", "-t", _exact(session), "-l", seq])
+    if not res.ok:
+        raise RuntimeError(res.stderr.strip() or "Failed to send mouse event")
+
+
+def _resolve_mouse_target(session: str, args: argparse.Namespace) -> tuple[int, int]:
+    """Resolve mouse target from text match or explicit coordinates."""
+    target_text: str | None = args.text
+
+    x: int
+    y: int
+
+    if target_text is not None:
+        if target_text == "":
+            raise ValueError("--text must not be empty")
+        if args.y is not None:
+            raise ValueError("--y cannot be used with --text")
+        if args.nth is not None and args.nth <= 0:
+            raise ValueError(f"--nth must be positive, got: {args.nth}")
+
+        screen = _capture_screen(session, trim=False, raw=False, join_wrapped=False)
+        matches = _find_text_matches(screen, target_text)
+        if not matches:
+            raise RuntimeError(f"Text not found on screen: {target_text!r}")
+
+        if args.nth is None:
+            if len(matches) > 1:
+                details = "\n".join(
+                    f"  {i}: row {row}, col {col_start}-{col_end}"
+                    for i, (row, col_start, col_end) in enumerate(matches, start=1)
+                )
+                raise RuntimeError(
+                    f"Text {target_text!r} matched {len(matches)} locations (0-based):\n"
+                    f"{details}\n"
+                    "Use --nth N to select one match"
+                )
+            y, col_start, col_end = matches[0]
+        else:
+            if args.nth > len(matches):
+                raise RuntimeError(
+                    f"Text {target_text!r} matched {len(matches)} locations; --nth {args.nth} is out of range"
+                )
+            y, col_start, col_end = matches[args.nth - 1]
+
+        x = (col_start + col_end) // 2
+    else:
+        if args.x is None or args.y is None:
+            raise ValueError("--x and --y are required unless --text is used")
+        if args.nth is not None:
+            raise ValueError("--nth can only be used with --text")
+        x = args.x
+        y = args.y
+
+    if x < 0 or y < 0:
+        raise ValueError(f"Coordinates must be >= 0, got: x={x}, y={y}")
+    cols, rows = _get_pane_dimensions(session)
+    if x >= cols or y >= rows:
+        raise ValueError(
+            f"Coordinates out of bounds: x={x}, y={y} for pane size {cols}x{rows}"
+        )
+    return (x, y)
+
+
+def _resolve_mouse_encoding(session: str, requested: str) -> str:
+    """Resolve mouse packet encoding (auto or explicit)."""
+    if requested != "auto":
+        return requested
+    mouse_mode = _get_mouse_mode(session)
+    encoding = mouse_mode.preferred_encoding() if mouse_mode is not None else None
+    return encoding or "x10"
+
+
+def cmd_send_mouse(args: argparse.Namespace) -> None:
+    """Send mouse click or wheel events by text target or coordinates."""
+    session = args.session
+    _require_session(session)
+    _require_unlocked(session)
+
+    meta = _get_pane_metadata(session)
+    if not meta.alternate:
+        raise RuntimeError("Mouse input is only supported in alternate screen mode")
+
+    encoding = _resolve_mouse_encoding(session, args.mouse_encoding)
+    x, y = _resolve_mouse_target(session, args)
+
+    scroll_up_n = args.scroll_up
+    scroll_down_n = args.scroll_down
+    if (scroll_up_n is not None or scroll_down_n is not None) and args.button is not None:
+        raise ValueError("--button cannot be combined with --scroll-up/--scroll-down")
+
+    if scroll_up_n is not None:
+        if scroll_up_n <= 0:
+            raise ValueError(f"--scroll-up must be positive, got: {scroll_up_n}")
+        for _ in range(scroll_up_n):
+            _send_mouse_sequence(session, _mouse_packet(encoding, 64, x, y, release=False))
+        return
+    if scroll_down_n is not None:
+        if scroll_down_n <= 0:
+            raise ValueError(f"--scroll-down must be positive, got: {scroll_down_n}")
+        for _ in range(scroll_down_n):
+            _send_mouse_sequence(session, _mouse_packet(encoding, 65, x, y, release=False))
+        return
+
+    button = args.button or "left"
+    press_code = 0 if button == "left" else 2
+    _send_mouse_sequence(session, _mouse_packet(encoding, press_code, x, y, release=False))
+    _send_mouse_sequence(session, _mouse_packet(encoding, press_code, x, y, release=True))
+
+
 def cmd_send_stdin(args: argparse.Namespace) -> None:
     """Send content from stdin to the session via tmux paste buffer."""
     session = args.session
@@ -1735,11 +2830,89 @@ def cmd_capture(args: argparse.Namespace) -> None:
 
     trim = not args.no_trim
     raw = args.raw
+    annotate_flag = args.annotate
+    no_annotate_flag = args.no_annotate
+    line_numbers = args.line_numbers
+    force = args.force
     scrollback: int | None = args.scrollback
     tail: int | None = args.tail
 
     if scrollback is not None and tail is not None:
         raise ValueError("--scrollback and --tail are mutually exclusive")
+
+    if annotate_flag and raw:
+        raise ValueError("--annotate and --raw are mutually exclusive")
+
+    if annotate_flag and scrollback is not None:
+        raise ValueError("--annotate cannot be combined with --scrollback")
+
+    if line_numbers and scrollback is not None:
+        raise ValueError("--line-numbers cannot be combined with --scrollback")
+
+    if scrollback is not None and not force and _is_alternate_screen(session):
+        raise ValueError(
+            "--scrollback is unreliable in alternate screen mode (TUI/TMUX) and may "
+            "return stale shell history. Use --force to override - if you know what you're doing."
+        )
+
+    # Auto-annotate only for active alternate-screen TUIs. In nested tmux/SSH,
+    # alternate_on may be true even at an idle shell prompt; keep default capture
+    # minimal in that case.
+    if annotate_flag:
+        annotate = True
+    elif no_annotate_flag:
+        annotate = False
+    elif raw or scrollback is not None:
+        annotate = False
+    else:
+        annotate = _is_alternate_screen(session) and not _is_at_prompt(session)
+
+    if annotate:
+        # --annotate: capture raw internally, produce stripped output + annotations
+        # Annotations are always computed on the full visible screen so detection
+        # is accurate; --tail just limits which lines/annotations are printed.
+        raw_output = _capture_screen(session, trim=False, raw=True)
+        annotations = _annotate_raw(raw_output)
+        meta = _get_pane_metadata(session)
+        stripped = _strip_ansi(raw_output)
+        if trim:
+            stripped = _trim_output(stripped)
+        numbered_lines = stripped.split("\n")
+        total = len(numbered_lines)
+        # Determine which 0-based rows to show
+        if tail is not None:
+            if tail <= 0:
+                raise ValueError(f"--tail must be positive, got: {tail}")
+            first_row = max(0, total - tail)
+        else:
+            first_row = 0
+        # Optional line numbering (1-based). Use 3-digit field; rows beyond
+        # 999 overflow naturally while keeping the delimiter unambiguous.
+        for i, line in enumerate(numbered_lines):
+            row_num = i
+            if row_num >= first_row:
+                if line_numbers:
+                    print(f"{row_num + 1:3d}│ {line}")
+                else:
+                    print(line)
+        # Metadata section: screen, bell, cursor, then highlights
+        print("Annotations:")
+        if meta.alternate:
+            print("  Screen: alternate")
+        if meta.bell:
+            print("  Bell: yes (cleared)")
+            _clear_alert_flags(session)
+        if meta.cursor is not None:
+            print(f"  Cursor: {_format_cursor_row_col(meta.cursor)}")
+        mouse_mode = _get_mouse_mode(session)
+        if mouse_mode is not None and mouse_mode.any:
+            mouse_label = mouse_mode.preferred_encoding() or "on"
+            print(f"  Mouse: {mouse_label}")
+        if annotations:
+            for row, text, label in annotations:
+                if row >= first_row:
+                    print(f"{row + 1:3d}│ {text} [{label}]")
+        return
 
     if scrollback is not None:
         if scrollback <= 0:
@@ -1775,12 +2948,23 @@ def cmd_capture(args: argparse.Namespace) -> None:
         # Capture only visible screen (no -J, physical rows preserved)
         output = _capture_screen(session, trim=trim, raw=raw)
 
-    print(output)
+    if line_numbers:
+        lines = output.split('\n')
+        for i, line in enumerate(lines, start=1):
+            print(f"{i:3d}│ {line}")
+    else:
+        print(output)
 
 def cmd_pipe_log(args: argparse.Namespace) -> None:
     """Stream terminal output to a log file (ANSI escapes stripped by default)."""
     session = args.session
     _require_session(session)
+
+    # pipe-pane -o silently does nothing when already piping, which can mislead
+    # callers into thinking the destination changed. Fail clearly instead.
+    pipe_state = _run_tmux(["display-message", "-p", "-t", _exact(session), "#{pane_pipe}"])
+    if pipe_state.ok and pipe_state.stdout.strip() == "1":
+        raise RuntimeError("Session is already piping output. Run unpipe first.")
 
     logfile = os.path.abspath(args.file)
     
@@ -1793,16 +2977,27 @@ def cmd_pipe_log(args: argparse.Namespace) -> None:
         # Raw output including escape codes
         shell_cmd = f"cat >> {shlex.quote(logfile)}"
     else:
-        # Strip ANSI escape codes using perl (more comprehensive than sed)
-        # Handles: CSI sequences, OSC sequences, bracketed paste mode, etc.
-        # Use unbuffered mode for real-time output
-        strip_cmd = r"perl -pe 'BEGIN{$|=1} s/\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b\[\?[0-9;]*[hl]//g'"
-        shell_cmd = f"{strip_cmd} >> {shlex.quote(logfile)}"
+        # Strip ANSI escape codes with Python stdlib (no perl dependency).
+        # Handles CSI and OSC sequences, including OSC terminated with BEL or ST.
+        strip_script = "\n".join([
+            "import re",
+            "import os",
+            "import sys",
+            "ansi = re.compile(br'\\x1b\\[[0-?]*[ -/]*[@-~]')",
+            "osc = re.compile(br'\\x1b\\][^\\x1b\\x07]*(?:\\x07|\\x1b\\\\)')",
+            "for chunk in iter(lambda: os.read(0, 4096), b''):",
+            "    chunk = osc.sub(b'', chunk)",
+            "    chunk = ansi.sub(b'', chunk)",
+            "    sys.stdout.buffer.write(chunk)",
+            "    sys.stdout.buffer.flush()",
+        ])
+        python_cmd = shlex.quote(sys.executable or "python3")
+        shell_cmd = f"{python_cmd} -u -c {shlex.quote(strip_script)} >> {shlex.quote(logfile)}"
     
     res = _run_tmux(["pipe-pane", "-o", "-t", _exact(session), shell_cmd])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to pipe pane")
-    
+
     mode = "raw" if args.raw else "clean"
     print(f"Piping output to {logfile} ({mode})")
 
@@ -1915,7 +3110,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     _require_session(session)
     
     # Get comprehensive session and pane info
-    fmt = "#{session_name}\t#{session_created}\t#{session_windows}\t#{session_attached}\t#{pane_width}\t#{pane_height}\t#{pane_pid}\t#{alternate_on}"
+    fmt = "#{session_name}\t#{session_created}\t#{session_windows}\t#{session_attached}\t#{pane_width}\t#{pane_height}\t#{pane_pid}\t#{alternate_on}\t#{pane_title}\t#{window_bell_flag}"
     res = _run_tmux(["display-message", "-p", "-t", _exact(session), fmt])
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to read session info")
@@ -1936,6 +3131,8 @@ def cmd_status(args: argparse.Namespace) -> None:
     height = safe_int(parts[5]) if len(parts) > 5 else None
     pane_pid = safe_int(parts[6]) if len(parts) > 6 else None
     alternate_on = parts[7].strip() == "1" if len(parts) > 7 else False
+    pane_title = parts[8] if len(parts) > 8 else ""
+    bell_flag = parts[9].strip() == "1" if len(parts) > 9 else False
 
     # Get shell name from pane_pid using ps
     shell_name = None
@@ -1969,8 +3166,19 @@ def cmd_status(args: argparse.Namespace) -> None:
     if foreground_command:
         print(f"Foreground: {foreground_command}")
     print(f"Screen: {'alternate' if alternate_on else 'normal'}")
+    if pane_title:
+        print(f"Title: {pane_title}")
+    if bell_flag:
+        print("Bell: yes (cleared)")
+        _clear_alert_flags(session)
     if width and height:
         print(f"Size: {width}x{height}")
+    cursor = _get_cursor_position(session)
+    if cursor is not None:
+        print(f"Cursor: {_format_cursor_row_col(cursor)}")
+    mouse_mode = _get_mouse_mode(session)
+    if mouse_mode is not None:
+        print(f"Mouse: {mouse_mode.status_string()}")
     print(f"Locked: {'yes' if _is_locked(session) else 'no'}")
     # Show process tree with shell as root
     if pane_pid and shell_name:
@@ -2096,7 +3304,9 @@ def cmd_wait_for(args: argparse.Namespace) -> None:
     poll_interval = POLL_INTERVAL_INITIAL
     
     while True:
-        screen = _capture_screen(session, trim=True)
+        # Join wrapped physical rows so patterns that span terminal-wrap
+        # boundaries are detected as a single logical line.
+        screen = _capture_screen(session, trim=True, join_wrapped=True)
         lines = screen.split('\n')
         
         for pattern in patterns:
@@ -2352,7 +3562,7 @@ def cmd_upload(args: argparse.Namespace) -> None:
                 _remote_exec(session, f"rm -f {remote_quoted}", 5.0)
                 raise RuntimeError(
                     f"Hash mismatch (sha256): "
-                    f"local={local_sha[:16]}... remote={remote_sha[:16]}..."
+                    f"local={local_sha} remote={remote_sha}"
                 )
             if verbose:
                 _eprint(f"Hash verified (sha256): {local_sha[:16]}...")
@@ -2374,6 +3584,7 @@ def cmd_download(args: argparse.Namespace) -> None:
     _require_session(session)
     _require_unlocked(session)
     _require_prompt_ready(session)
+    start_on_alt = _is_alternate_screen(session)
 
     pane_w, _ = _get_pane_dimensions(session)
     if pane_w < MIN_TRANSFER_COLS:
@@ -2428,7 +3639,7 @@ def cmd_download(args: argparse.Namespace) -> None:
     on_probe_alt = True
 
     try:
-        if strategy != "chunked":
+        if not start_on_alt and strategy != "chunked":
             # Try pipe-pane first
             if verbose:
                 _eprint("Trying pipe-pane download strategy...")
@@ -2459,7 +3670,21 @@ def cmd_download(args: argparse.Namespace) -> None:
                 result = None
 
             if result is not None:
-                decoded, remote_sha = result
+                decoded_candidate, remote_sha_candidate = result
+                if remote_sha_candidate:
+                    local_sha_candidate = hashlib.sha256(decoded_candidate).hexdigest()
+                    if local_sha_candidate != remote_sha_candidate:
+                        if verbose:
+                            _eprint(
+                                "pipe-pane: hash mismatch, switching to chunked strategy"
+                            )
+                        _set_dl_strategy(session, "chunked")
+                    else:
+                        decoded, remote_sha = decoded_candidate, remote_sha_candidate
+                else:
+                    # Keep existing behavior: accept payload even if remote hash
+                    # marker was not parsed; final verification will be skipped.
+                    decoded, remote_sha = decoded_candidate, remote_sha_candidate
             else:
                 if verbose:
                     _eprint("Pipe-pane failed or corruption detected, switching to chunked")
@@ -2468,7 +3693,10 @@ def cmd_download(args: argparse.Namespace) -> None:
         if decoded is None:
             # Chunked fallback
             if verbose:
-                _eprint("Using chunked screen-capture download strategy...")
+                if start_on_alt:
+                    _eprint("Using chunked screen-capture download strategy (alternate screen mode)...")
+                else:
+                    _eprint("Using chunked screen-capture download strategy...")
             decoded, remote_sha = _download_chunked(
                 session, remote_path, python_bin, timeout, verbose,
                 already_on_alt=on_probe_alt,
@@ -2483,7 +3711,7 @@ def cmd_download(args: argparse.Namespace) -> None:
         if local_sha != remote_sha:
             raise RuntimeError(
                 f"Hash mismatch (sha256): "
-                f"remote={remote_sha[:16]}... local={local_sha[:16]}..."
+                f"remote={remote_sha} local={local_sha}"
             )
         if verbose:
             _eprint(f"Hash verified (sha256): {local_sha[:16]}...")
@@ -2517,8 +3745,9 @@ def cmd_request(args: argparse.Namespace) -> None:
     
     message = args.message or "Human assistance requested"
     
-    # Clear any stale detached flag from previous request
+    # Clear stale state from previous requests.
     _clear_detached(session)
+    _clear_response(session)
     
     # Store request in tmux user option (can be read via #{@term_cli_request} in format strings)
     _run_tmux(["set-option", "-t", _exact(session), TERM_CLI_REQUEST_OPT, message])
@@ -2613,6 +3842,7 @@ tmux keys: C-c C-d C-u C-z (ctrl), Enter Escape Space Tab BSpace, Up Down Left R
   term-cli start --session build --cwd /path/to/project
   term-cli run --session build "make test" --wait --timeout 60
   term-cli capture --session build
+  term-cli send-mouse --session build --text "OK"
   term-cli send-key --session build C-c
   term-cli wait --session build --timeout 10
   term-cli upload --session build ./config.json /app/config.json
@@ -2676,14 +3906,80 @@ Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var
     sp.add_argument("key", help="Key (tmux notation)")
     sp.set_defaults(func=cmd_send_key)
 
+    # send-mouse
+    sp = sub.add_parser(
+        "send-mouse",
+        help="Send mouse event in alternate screen mode",
+        description=(
+            "Send a mouse packet to the active TUI.\n"
+            "Target by visible text (with optional --nth) or by coordinates.\n"
+            "Coordinates are 0-based. Session must be in alternate screen mode."
+        ),
+    )
+    sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
+    target_group = sp.add_mutually_exclusive_group(required=True)
+    target_group.add_argument("--text", metavar="TEXT", help="Target visible text (uses its center point)")
+    target_group.add_argument("--x", type=int, metavar="N", help="X coordinate (0-based, requires --y)")
+    sp.add_argument("--y", type=int, metavar="N", help="Y coordinate (0-based, required with --x)")
+    sp.add_argument("--nth", type=int, metavar="N", help="Select Nth text match (1-based) when --text is ambiguous")
+    sp.add_argument(
+        "--button",
+        choices=["left", "right"],
+        help="Mouse click button (default: left)",
+    )
+    scroll_group = sp.add_mutually_exclusive_group()
+    scroll_group.add_argument(
+        "-u",
+        "--scroll-up",
+        type=int,
+        nargs="?",
+        const=1,
+        metavar="N",
+        help="Send wheel-up event (optionally N times; default: 1)",
+    )
+    scroll_group.add_argument(
+        "-d",
+        "--scroll-down",
+        type=int,
+        nargs="?",
+        const=1,
+        metavar="N",
+        help="Send wheel-down event (optionally N times; default: 1)",
+    )
+    sp.add_argument(
+        "--mouse-encoding",
+        choices=["auto", "x10", "utf8", "sgr"],
+        default="auto",
+        help="Mouse packet encoding (default: auto)",
+    )
+    sp.set_defaults(func=cmd_send_mouse)
+
     # capture
     sp = sub.add_parser("capture", help="Capture screen (visible, trimmed)")
     sp.add_argument("-s", "--session", required=True, metavar="NAME", help="Session name")
     sp.add_argument("-n", "--scrollback", type=int, metavar="N",
-                    help="Last N logical lines from scrollback+visible history (joins wrapped lines)")
+                     help="Last N logical lines from scrollback+visible history (joins wrapped lines)")
     sp.add_argument("-t", "--tail", type=int, metavar="N",
-                    help="Last N physical rows from bottom of visible screen")
-    sp.add_argument("-r", "--raw", action="store_true", help="Include ANSI escape codes (colors)")
+                     help="Last N physical rows from bottom of visible screen")
+    sp.add_argument(
+        "-l",
+        "--line-numbers",
+        action="store_true",
+        help="Prefix output lines with 1-based row numbers (not with --scrollback)",
+    )
+    sp.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Allow --scrollback in alternate screen mode (may be stale/misleading)",
+    )
+    sp.add_argument("-r", "--raw", action="store_true",
+                    help="Include ANSI escape codes (colors)")
+    ann_mode = sp.add_mutually_exclusive_group()
+    ann_mode.add_argument("-a", "--annotate", action="store_true",
+                          help="Force annotations on")
+    ann_mode.add_argument("--no-annotate", action="store_true",
+                          help="Force annotations off")
     sp.add_argument("--no-trim", action="store_true", help="Keep trailing whitespace")
     sp.set_defaults(func=cmd_capture)
 
@@ -2804,7 +4100,7 @@ Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var
 
 # All valid command names for prefix matching
 COMMANDS = [
-    "list", "start", "kill", "run", "send-text", "send-key", "send-stdin",
+    "list", "start", "kill", "run", "send-text", "send-key", "send-mouse", "send-stdin",
     "capture", "pipe-log", "unpipe", "status", "resize", "scroll",
     "wait", "wait-idle", "wait-for",
     "upload", "download",

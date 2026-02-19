@@ -3,5 +3,5 @@ pythonVersion = "3.8"
 typeCheckingMode = "standard"
 extraPaths = ["tests"]
 
-# Exclude non-Python files that happen to be Python scripts
-include = ["tests/**/*.py"]
+# Type-check both CLI entrypoints and tests
+include = ["term-cli", "term-assist", "tests/**/*.py"]

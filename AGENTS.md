@@ -8,6 +8,8 @@ This repo is **term-cli**: a single-file Python CLI that wraps **tmux** to let a
 
 - **Prefer `wait`** (prompt detection with a strong heuristic) for shells/REPLs; **use `wait-idle`** for TUIs (vim/htop/less) or screens without a detectable prompt; **use `wait-for`** only when you truly need specific text.
 
+Do not access, write or modify files outside of the current directory without explicit permission. If you need to write temporary files, keep them in _tmp.
+
 ## Wait Semantics (Important)
 
 - `wait` detects a **prompt** using cursor position + screen content (designed to handle SSH where old prompts remain visible).
@@ -32,7 +34,7 @@ term-cli -L t1 start -s dev -c ./proj -x 120 -y 34 -e FOO=bar -e PYTHONUNBUFFERE
 # List (shows [LOCKED] marker)
 term-cli -L t1 list
 
-# Status (idle/running + process tree + attached + created)
+# Status (idle/running + process tree + cursor + attached + created)
 term-cli -L t1 status -s dev
 
 # Resize later (cols only here)
@@ -75,6 +77,10 @@ term-cli send-key -s dev C-c
 term-cli send-key -s dev Escape
 term-cli send-key -s dev Up
 
+# Mouse events in TUIs (alternate screen only)
+term-cli send-mouse -s dev --text "[ OK ]"
+term-cli send-mouse -s dev --text "[ OK ]" --scroll-down 3
+
 # Multiline (stdin -> tmux buffer -> paste)
 cat <<'EOF' | term-cli send-stdin -s dev
 export PATH="$HOME/bin:$PATH"
@@ -93,6 +99,21 @@ term-cli capture -s dev --tail 5
 
 # Include scrollback (-n) and ANSI escapes (-r)
 term-cli capture -s dev -n 20 -r
+
+# In alternate screen (TUI / nested tmux), --scrollback is blocked by default
+# Use --force only if you explicitly want potentially stale/misleading history
+term-cli capture -s dev -n 20 --force
+
+# Annotated capture — pane metadata + highlight annotations
+# Shows screen mode, bell, cursor position (row,col 1-based), mouse mode (if enabled), and highlighted TUI elements
+term-cli capture -s dev -a
+
+# Plain capture auto-enables annotations only for active alternate-screen TUIs
+# Force plain output with --no-annotate
+term-cli capture -s dev --no-annotate
+
+# Optional 1-based line numbers for visible-screen captures
+term-cli capture -s dev -a --line-numbers
 
 # Pipe output to a file; strips ANSI by default (use -r for raw)
 term-cli pipe-log -s dev /tmp/dev.log
@@ -160,10 +181,11 @@ term-cli request-w -s a -t 300
 - `TERM_CLI_COLS` / `TERM_CLI_ROWS` env vars override defaults.
 - `start --no-size` lets tmux decide size.
 - `capture` trims trailing whitespace and blank lines unless `--no-trim`.
+- `capture --scrollback` is blocked in alternate screen mode by default because tmux history can be stale/misleading there (common with nested/remote tmux). Use `--tail`/`--annotate` for current view, or `--force` to override.
 
 ### `status`
 
-- Prints: session name, idle/running, foreground command (best-effort), screen mode (normal/alternate), size, locked state, attached state, created timestamp, and a process tree.
+- Prints: session name, idle/running, foreground command (best-effort), screen mode (normal/alternate), title (if set), bell (one-shot), size, cursor position (`Cursor: row,col`, 1-based), mouse mode (`Mouse: ...`), locked state, attached state, created timestamp, and a process tree.
 - “running” is inferred from foreground process markers (best-effort; treat as advisory).
 - “Screen: alternate” means a full-screen TUI (vim, htop, less) is active — use `wait-idle` instead of `wait`.
 
@@ -319,8 +341,9 @@ If the repo provides a test runner script, use it (it’s typically faster than 
 
 ```bash
 ./run-tests.sh                 # parallel + serial where needed
-./run-tests.sh -s              # sequential (debugging)
+./run-tests.sh -s              # sequential (debugging) - avoid
 ```
+**If you run more than 3 tests, make sure to invoke tests to run in parallel**
 
 Manual smoke (unique session name recommended in tests/CI):
 ```bash

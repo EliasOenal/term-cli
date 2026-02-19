@@ -10,12 +10,13 @@ compression, hash verification) without network dependencies.
 from __future__ import annotations
 
 import hashlib
+import argparse
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Generator
+from typing import Any, Callable, Generator
 
 import pytest
 
@@ -815,6 +816,56 @@ class TestDownloadFallback:
         # Verbose output should mention pipe-pane attempt
         assert "pipe-pane" in result.stderr.lower()
         assert local_dest.read_text() == "try pipe first\n"
+
+    def test_pipe_fault_injection_falls_back_to_chunked(
+        self,
+        transfer_session: str,
+        term_cli: Callable[..., RunResult],
+        tmux_socket: str,
+        tmp_path: Path,
+    ) -> None:
+        """Injected pipe payload loss should trigger chunked fallback and succeed."""
+        subprocess.run(
+            [
+                "tmux", "-L", tmux_socket, "set-option", "-t", f"={transfer_session}:",
+                "-u", "@term_cli_dl_strategy",
+            ],
+            capture_output=True,
+        )
+
+        remote = tmp_path / "pipe_fault.bin"
+        # Incompressible-ish data so we get plenty of base64 lines to drop.
+        remote.write_bytes(os.urandom(512 * 1024))
+        expected_sha = hashlib.sha256(remote.read_bytes()).hexdigest()
+
+        local_dest = tmp_path / "dl_pipe_fault.bin"
+        env = {
+            **os.environ,
+            "TERM_CLI_TEST_HOOKS": "1",
+            "TERM_CLI_TEST_PIPE_DROP_BLOCK": "12:220",
+        }
+        proc = subprocess.run(
+            [
+                sys.executable, str(TERM_CLI),
+                "-L", tmux_socket,
+                "download", "-s", transfer_session,
+                "pipe_fault.bin", str(local_dest),
+                "-v", "-t", "20",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=40,
+        )
+
+        assert proc.returncode == 0, (
+            f"download failed: stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+        stderr = proc.stderr.lower()
+        assert "trying pipe-pane" in stderr
+        assert "switching to chunked" in stderr
+        assert local_dest.exists()
+        assert hashlib.sha256(local_dest.read_bytes()).hexdigest() == expected_sha
 
 
 # ---------------------------------------------------------------------------
@@ -2383,3 +2434,254 @@ class TestPythonNotAvailable:
 
         finally:
             cleanup_session(tmux_socket, name, term_cli)
+
+
+# ---------------------------------------------------------------------------
+# Probe parsing robustness (unit)
+# ---------------------------------------------------------------------------
+
+class TestProbeParsingRobustness:
+    """Unit tests for transfer probe marker parsing under wrapped/truncated output."""
+
+    @pytest.fixture(scope="class")
+    def transfer_module(self) -> Any:
+        """Import term-cli as a Python module for direct function tests."""
+        from importlib.machinery import SourceFileLoader
+
+        loader = SourceFileLoader("term_cli_transfer_module", str(TERM_CLI))
+        return loader.load_module()
+
+    def test_probe_python_parses_tag_with_prefix_noise(
+        self,
+        transfer_module: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """_probe_python should detect TC_PY3 even when not at line start."""
+        fixed_pid = 4242
+        fixed_time = 1234.567
+        probe_id = f"{fixed_pid}_{int(fixed_time * 1000) & 0xFFFFFF}"
+
+        monkeypatch.setattr(transfer_module.os, "getpid", lambda: fixed_pid)
+        monkeypatch.setattr(transfer_module.time, "time", lambda: fixed_time)
+
+        # First marker is clipped at line end; second marker is intact but
+        # prefixed by prompt/noise text.
+        screen = (
+            f"TC_PY3_{probe_id}_O\n"
+            f"very/long/path$ TC_PY3_{probe_id}_OK\n"
+            f"TC_PY_DONE_{probe_id}\n"
+        )
+        monkeypatch.setattr(
+            transfer_module,
+            "_remote_exec_until_marker",
+            lambda *_args, **_kwargs: screen,
+        )
+
+        py_bin = transfer_module._probe_python("dummy", 5.0)
+        assert py_bin == "python3"
+
+    def test_probe_python_parses_python_alias_major3(
+        self,
+        transfer_module: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """_probe_python should accept python when marker reports major=3."""
+        fixed_pid = 777
+        fixed_time = 2000.0
+        probe_id = f"{fixed_pid}_{int(fixed_time * 1000) & 0xFFFFFF}"
+
+        monkeypatch.setattr(transfer_module.os, "getpid", lambda: fixed_pid)
+        monkeypatch.setattr(transfer_module.time, "time", lambda: fixed_time)
+        monkeypatch.setattr(
+            transfer_module,
+            "_remote_exec_until_marker",
+            lambda *_args, **_kwargs: f"tmux$ TC_PYBIN_{probe_id}_3\n",
+        )
+
+        py_bin = transfer_module._probe_python("dummy", 5.0)
+        assert py_bin == "python"
+
+    def test_probe_python_missing_raises_error(
+        self,
+        transfer_module: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """_probe_python raises when neither python3 nor python=3 is detected."""
+        monkeypatch.setattr(
+            transfer_module,
+            "_remote_exec_until_marker",
+            lambda *_args, **_kwargs: "no probe markers here\n",
+        )
+
+        with pytest.raises(RuntimeError, match="Python 3 is not available"):
+            transfer_module._probe_python("dummy", 5.0)
+
+    def test_remote_file_exists_parses_yes_no_with_partial_first_tag(
+        self,
+        transfer_module: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """_remote_file_exists should tolerate a partially clipped first marker."""
+        fixed_pid = 9090
+        fixed_time = 3456.789
+        marker = f"{fixed_pid}_{int(fixed_time * 1000) & 0xFFFFFF}"
+        yes_tag = f"TC_FE_{marker}_0"
+        no_tag = f"TC_FE_{marker}_1"
+
+        monkeypatch.setattr(transfer_module.os, "getpid", lambda: fixed_pid)
+        monkeypatch.setattr(transfer_module.time, "time", lambda: fixed_time)
+
+        monkeypatch.setattr(
+            transfer_module,
+            "_remote_exec_until_marker",
+            lambda *_args, **_kwargs: f"{yes_tag[:-1]}\nlong/prompt$ {yes_tag}\n",
+        )
+        assert transfer_module._remote_file_exists("dummy", "x.txt", 5.0) is True
+
+        monkeypatch.setattr(
+            transfer_module,
+            "_remote_exec_until_marker",
+            lambda *_args, **_kwargs: f"{no_tag[:-1]}\nlong/prompt$ {no_tag}\n",
+        )
+        assert transfer_module._remote_file_exists("dummy", "x.txt", 5.0) is False
+
+    def test_cmd_download_falls_back_to_chunked_on_pipe_hash_mismatch(
+        self,
+        transfer_module: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """cmd_download should retry with chunked when pipe-pane hash mismatches."""
+        out_path = tmp_path / "fallback_chunked.bin"
+        chunked_data = b"chunked-data-ok"
+        chunked_sha = hashlib.sha256(chunked_data).hexdigest()
+
+        monkeypatch.setattr(transfer_module, "_require_session", lambda *_: None)
+        monkeypatch.setattr(transfer_module, "_require_unlocked", lambda *_: None)
+        monkeypatch.setattr(transfer_module, "_require_prompt_ready", lambda *_: None)
+        monkeypatch.setattr(transfer_module, "_is_alternate_screen", lambda *_: False)
+        monkeypatch.setattr(transfer_module, "_get_pane_dimensions", lambda *_: (80, 24))
+        monkeypatch.setattr(transfer_module, "_hide_probe_start", lambda *_: None)
+        monkeypatch.setattr(transfer_module, "_probe_python", lambda *_: "python3")
+        monkeypatch.setattr(transfer_module, "_remote_file_exists", lambda *_: True)
+        monkeypatch.setattr(transfer_module, "_restore_terminal", lambda *_: None)
+        monkeypatch.setattr(transfer_module, "_get_dl_strategy", lambda *_: None)
+
+        set_calls: list[str] = []
+        monkeypatch.setattr(
+            transfer_module,
+            "_set_dl_strategy",
+            lambda _session, value: set_calls.append(value),
+        )
+
+        calls = {"pipe": 0, "chunked": 0}
+
+        def fake_download_pipe(*_args: Any, **_kwargs: Any) -> tuple[bytes, str]:
+            calls["pipe"] += 1
+            return (b"pipe-data", "f" * 64)
+
+        def fake_download_chunked(*_args: Any, **_kwargs: Any) -> tuple[bytes, str]:
+            calls["chunked"] += 1
+            return (chunked_data, chunked_sha)
+
+        monkeypatch.setattr(transfer_module, "_download_pipe", fake_download_pipe)
+        monkeypatch.setattr(transfer_module, "_download_chunked", fake_download_chunked)
+
+        args = argparse.Namespace(
+            session="dummy",
+            remote_path="remote.txt",
+            local_path=str(out_path),
+            timeout=5.0,
+            verbose=False,
+            force=False,
+        )
+        transfer_module.cmd_download(args)
+
+        assert calls == {"pipe": 1, "chunked": 1}
+        assert set_calls == ["chunked"]
+        assert out_path.read_bytes() == chunked_data
+
+    def test_cmd_download_uses_chunked_in_alternate_screen(
+        self,
+        transfer_module: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """cmd_download skips pipe strategy when starting on alternate screen."""
+        out_path = tmp_path / "alt_start_chunked.bin"
+        chunked_data = b"chunked-alt-ok"
+        chunked_sha = hashlib.sha256(chunked_data).hexdigest()
+
+        monkeypatch.setattr(transfer_module, "_require_session", lambda *_: None)
+        monkeypatch.setattr(transfer_module, "_require_unlocked", lambda *_: None)
+        monkeypatch.setattr(transfer_module, "_require_prompt_ready", lambda *_: None)
+        monkeypatch.setattr(transfer_module, "_is_alternate_screen", lambda *_: True)
+        monkeypatch.setattr(transfer_module, "_get_pane_dimensions", lambda *_: (80, 24))
+        monkeypatch.setattr(transfer_module, "_hide_probe_start", lambda *_: None)
+        monkeypatch.setattr(transfer_module, "_probe_python", lambda *_: "python3")
+        monkeypatch.setattr(transfer_module, "_remote_file_exists", lambda *_: True)
+        monkeypatch.setattr(transfer_module, "_restore_terminal", lambda *_: None)
+        monkeypatch.setattr(transfer_module, "_get_dl_strategy", lambda *_: None)
+
+        set_calls: list[str] = []
+        monkeypatch.setattr(
+            transfer_module,
+            "_set_dl_strategy",
+            lambda _session, value: set_calls.append(value),
+        )
+
+        calls = {"pipe": 0, "chunked": 0}
+
+        def fake_download_pipe(*_args: Any, **_kwargs: Any) -> tuple[bytes, str]:
+            calls["pipe"] += 1
+            return (b"pipe-data", "f" * 64)
+
+        def fake_download_chunked(*_args: Any, **_kwargs: Any) -> tuple[bytes, str]:
+            calls["chunked"] += 1
+            return (chunked_data, chunked_sha)
+
+        monkeypatch.setattr(transfer_module, "_download_pipe", fake_download_pipe)
+        monkeypatch.setattr(transfer_module, "_download_chunked", fake_download_chunked)
+
+        args = argparse.Namespace(
+            session="dummy",
+            remote_path="remote.txt",
+            local_path=str(out_path),
+            timeout=5.0,
+            verbose=False,
+            force=False,
+        )
+        transfer_module.cmd_download(args)
+
+        assert calls == {"pipe": 0, "chunked": 1}
+        assert set_calls == []
+        assert out_path.read_bytes() == chunked_data
+
+    def test_download_chunked_rejects_unparseable_info_marker(
+        self,
+        transfer_module: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """_download_chunked should error when TC_DL_INFO cannot be parsed."""
+        monkeypatch.setattr(transfer_module, "_get_pane_dimensions", lambda *_: (80, 24))
+        monkeypatch.setattr(transfer_module, "_run_helper", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            transfer_module,
+            "_wait_for_any_text",
+            lambda *_args, **_kwargs: ("TC_DL_INFO", 0.0),
+        )
+        monkeypatch.setattr(
+            transfer_module,
+            "_capture_screen",
+            lambda *_args, **_kwargs: "noise without info marker",
+        )
+
+        with pytest.raises(RuntimeError, match="could not parse TC_DL_INFO"):
+            transfer_module._download_chunked(
+                "dummy",
+                "remote.txt",
+                "python3",
+                5.0,
+                False,
+                already_on_alt=False,
+            )

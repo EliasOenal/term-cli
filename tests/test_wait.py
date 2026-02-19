@@ -356,6 +356,15 @@ class TestWaitFor:
         result = term_cli("wait-f", "-s", session, "abbrev_test", "-t", "5")
         assert result.ok
 
+    def test_wait_for_detects_pattern_across_wrapped_rows(self, session, term_cli):
+        """wait-for should match a token split by terminal line wrapping."""
+        term_cli("resize", "-s", session, "-x", "20", "-y", "24", check=True)
+        marker = "WRAP_MARKER_ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        # Use printf to avoid pattern appearing in command echo line.
+        term_cli("run", "-s", session, f"printf 'WRAP_MARKER_%s\\n' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'", "-w")
+        result = term_cli("wait-for", "-s", session, marker, "-t", "5")
+        assert result.ok, f"wait-for failed to match wrapped marker: {result.stderr}"
+
 
 class TestWaitCursorDetection:
     """Tests for cursor-based prompt detection in 'wait' command."""

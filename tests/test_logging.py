@@ -138,6 +138,17 @@ class TestPipeLog:
         assert result.returncode == 2  # EXIT_INPUT_ERROR
         assert "parent directory" in result.stderr.lower() or "does not exist" in result.stderr.lower()
 
+    def test_pipe_log_second_invocation_requires_unpipe_first(self, session, term_cli, tmp_path):
+        """Re-running pipe-log should fail clearly while piping is active."""
+        first = tmp_path / "first.log"
+        second = tmp_path / "second.log"
+
+        term_cli("pipe-log", "-s", session, str(first), check=True)
+        result = term_cli("pipe-log", "-s", session, str(second))
+        assert not result.ok
+        assert "already piping" in result.stderr.lower()
+        term_cli("unpipe", "-s", session, check=True)
+
 
 class TestUnpipe:
     """Tests for the 'unpipe' command."""

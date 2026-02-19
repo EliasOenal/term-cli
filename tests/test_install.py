@@ -373,6 +373,22 @@ class TestPrerequisites:
         # Either tmux is found or a warning is shown
         assert "tmux found" in result.stdout or "tmux not found" in result.stderr
 
+    def test_accepts_python4_for_prereq_check(self, tmp_path: Path) -> None:
+        """Python 4.x should satisfy the Python 3.8+ requirement."""
+        fake_bin = tmp_path / "fakebin"
+        fake_bin.mkdir()
+        fake_python3 = fake_bin / "python3"
+        fake_python3.write_text("#!/bin/sh\nprintf '4.0.0\\n'\n")
+        fake_python3.chmod(0o755)
+
+        bin_dir = tmp_path / "bin"
+        result = run_installer(
+            "--prefix", str(bin_dir), "--no-skill",
+            env_override={"PATH": f"{fake_bin}:/usr/bin:/bin"},
+        )
+        assert result.returncode == 0
+        assert "python3 found (4.0.0)" in result.stdout
+
 
 # ── Download mode ──────────────────────────────────────────────────────
 

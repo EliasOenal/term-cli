@@ -113,8 +113,14 @@ class TestCommandAbbreviation:
         result = term_cli("send-k", "-s", session, "Enter")
         assert result.ok
 
+    def test_abbreviation_send_m_for_send_mouse(self, session, term_cli):
+        """'send-m' abbreviates to 'send-mouse'."""
+        result = term_cli("send-m", "-s", session, "--x", "0", "--y", "0")
+        assert not result.ok
+        assert "alternate" in result.stderr.lower()
+
     def test_ambiguous_s_fails(self, term_cli):
-        """'s' is ambiguous (start, status, send-text, send-key, send-stdin, scroll)."""
+        """'s' is ambiguous across s* commands."""
         result = term_cli("s", "-s", "test")
         assert not result.ok
         assert "Ambiguous command" in result.stderr

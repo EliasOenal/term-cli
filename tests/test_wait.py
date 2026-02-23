@@ -90,7 +90,10 @@ class TestWait:
         result = term_cli("wait", "-s", session, "-t", "-1")
         assert not result.ok
         assert result.returncode == 2  # EXIT_INPUT_ERROR
-        assert "negative" in result.stderr.lower() or "non-negative" in result.stderr.lower()
+        assert (
+            "negative" in result.stderr.lower()
+            or "non-negative" in result.stderr.lower()
+        )
 
     def test_wait_zero_timeout(self, session, term_cli):
         """wait with zero timeout returns immediately."""
@@ -149,7 +152,12 @@ class TestWaitIdle:
     def test_wait_idle_with_slow_output(self, session, term_cli):
         """wait-idle handles commands with slow output."""
         # Echo with delays
-        term_cli("run", "-s", session, "echo start; sleep 0.3; echo middle; sleep 0.3; echo end")
+        term_cli(
+            "run",
+            "-s",
+            session,
+            "echo start; sleep 0.3; echo middle; sleep 0.3; echo end",
+        )
         result = term_cli("wait-idle", "-s", session, "-i", "0.5", "-t", "5")
         # Should eventually become idle
         assert "Idle for" in result.stdout
@@ -169,11 +177,14 @@ class TestWaitIdle:
     def test_wait_idle_after_ctrl_c(self, session, term_cli):
         """wait-idle works after interrupting a command."""
         from conftest import retry_until
+
         term_cli("run", "-s", session, "sleep 100")
+
         # Wait for sleep to actually start before sending Ctrl-C
         def check_sleep_started():
             result = term_cli("status", "-s", session)
             return "sleep" in result.stdout
+
         assert retry_until(check_sleep_started, timeout=15.0), "sleep never started"
         term_cli("send-key", "-s", session, "C-c")
         result = term_cli("wait-idle", "-s", session, "-i", "0.5", "-t", "5")
@@ -197,14 +208,20 @@ class TestWaitIdle:
         result = term_cli("wait-idle", "-s", session, "-i", "0.5", "-t", "-1")
         assert not result.ok
         assert result.returncode == 2  # EXIT_INPUT_ERROR
-        assert "negative" in result.stderr.lower() or "non-negative" in result.stderr.lower()
+        assert (
+            "negative" in result.stderr.lower()
+            or "non-negative" in result.stderr.lower()
+        )
 
     def test_wait_idle_negative_seconds(self, session, term_cli):
         """wait-idle with negative idle seconds is rejected."""
         result = term_cli("wait-idle", "-s", session, "-i", "-1", "-t", "5")
         assert not result.ok
         assert result.returncode == 2  # EXIT_INPUT_ERROR
-        assert "negative" in result.stderr.lower() or "non-negative" in result.stderr.lower()
+        assert (
+            "negative" in result.stderr.lower()
+            or "non-negative" in result.stderr.lower()
+        )
 
 
 class TestWaitFor:
@@ -220,7 +237,9 @@ class TestWaitFor:
 
     def test_wait_for_timeout(self, session, term_cli):
         """wait-for times out if pattern doesn't appear."""
-        result = term_cli("wait-for", "-s", session, "never_gonna_find_this_xyz", "-t", "0.5")
+        result = term_cli(
+            "wait-for", "-s", session, "never_gonna_find_this_xyz", "-t", "0.5"
+        )
         assert not result.ok
         assert result.returncode == 3  # EXIT_TIMEOUT
         assert "pattern not detected" in result.stderr
@@ -229,7 +248,16 @@ class TestWaitFor:
     def test_wait_for_multiple_patterns(self, session, term_cli):
         """wait-for with multiple patterns returns on first match."""
         term_cli("run", "-s", session, "echo 'found_second_pattern'", "-w")
-        result = term_cli("wait-for", "-s", session, "not_here", "found_second_pattern", "also_not_here", "-t", "5")
+        result = term_cli(
+            "wait-for",
+            "-s",
+            session,
+            "not_here",
+            "found_second_pattern",
+            "also_not_here",
+            "-t",
+            "5",
+        )
         assert result.ok
         assert "found_second_pattern" in result.stdout
 
@@ -260,19 +288,23 @@ class TestWaitFor:
         # The captured line should contain the full context
         assert "marker" in result.stdout
         # Output should have at least two lines (detection message + captured line)
-        lines = result.stdout.strip().split('\n')
+        lines = result.stdout.strip().split("\n")
         assert len(lines) >= 2
 
     def test_wait_for_print_match_context(self, session, term_cli):
         """wait-for --print-match-context prints surrounding lines."""
         # Use printf to build the marker so it doesn't appear in the echoed command
-        term_cli("run", "-s", session,
-                 "echo 'aaa'; echo 'bbb'; printf 'cc%s\\n' 'c'; echo 'ddd'; echo 'eee'",
-                 "-w")
+        term_cli(
+            "run",
+            "-s",
+            session,
+            "echo 'aaa'; echo 'bbb'; printf 'cc%s\\n' 'c'; echo 'ddd'; echo 'eee'",
+            "-w",
+        )
         result = term_cli("wait-for", "-s", session, "ccc", "-C", "1", "-t", "5")
         assert result.ok
         assert "Pattern detected" in result.stdout
-        lines = result.stdout.strip().split('\n')
+        lines = result.stdout.strip().split("\n")
         # First line is the detection message, remaining lines are context
         context_lines = lines[1:]
         assert len(context_lines) == 3  # bbb, ccc, ddd
@@ -283,9 +315,11 @@ class TestWaitFor:
     def test_wait_for_print_match_context_implies_print(self, session, term_cli):
         """wait-for -C implies --print-match (no need for -p)."""
         term_cli("run", "-s", session, "echo 'ctx_marker_line'", "-w")
-        result = term_cli("wait-for", "-s", session, "ctx_marker_line", "-C", "0", "-t", "5")
+        result = term_cli(
+            "wait-for", "-s", session, "ctx_marker_line", "-C", "0", "-t", "5"
+        )
         assert result.ok
-        lines = result.stdout.strip().split('\n')
+        lines = result.stdout.strip().split("\n")
         # -C 0 means just the matched line (same as -p alone)
         assert len(lines) >= 2  # detection message + matched line
         assert any("ctx_marker_line" in l for l in lines[1:])
@@ -307,7 +341,10 @@ class TestWaitFor:
         result = term_cli("wait-for", "-s", session, "pattern", "-t", "-1")
         assert not result.ok
         assert result.returncode == 2  # EXIT_INPUT_ERROR
-        assert "negative" in result.stderr.lower() or "non-negative" in result.stderr.lower()
+        assert (
+            "negative" in result.stderr.lower()
+            or "non-negative" in result.stderr.lower()
+        )
 
     def test_wait_for_zero_timeout(self, session, term_cli):
         """wait-for with zero timeout checks once and returns."""
@@ -327,6 +364,7 @@ class TestWaitFor:
         """wait-for returns quickly when pattern is already present."""
         # Echo a known pattern that will definitely be on screen
         import time
+
         term_cli("run", "-s", session, "echo 'READY_MARKER'", "-w")
         # run -w already waits for command to complete, pattern should be on screen
         start = time.time()
@@ -334,11 +372,14 @@ class TestWaitFor:
         elapsed = time.time() - start
         # Should find the pattern almost immediately
         assert result.ok
-        assert elapsed < 1, f"Pattern already on screen should be found quickly, took {elapsed}s"
+        assert elapsed < 1, (
+            f"Pattern already on screen should be found quickly, took {elapsed}s"
+        )
 
     def test_wait_for_waits_for_pattern(self, session, term_cli):
         """wait-for actually waits for pattern to appear."""
         import time
+
         # Start a command that will output a pattern after a delay
         # The pattern "DONE123" will appear on its own line after the sleep
         # but only in the output, not in the command itself when using printf
@@ -361,7 +402,13 @@ class TestWaitFor:
         term_cli("resize", "-s", session, "-x", "20", "-y", "24", check=True)
         marker = "WRAP_MARKER_ABCDEFGHIJKLMNOPQRSTUVWXYZ"
         # Use printf to avoid pattern appearing in command echo line.
-        term_cli("run", "-s", session, f"printf 'WRAP_MARKER_%s\\n' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'", "-w")
+        term_cli(
+            "run",
+            "-s",
+            session,
+            f"printf 'WRAP_MARKER_%s\\n' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'",
+            "-w",
+        )
         result = term_cli("wait-for", "-s", session, marker, "-t", "5")
         assert result.ok, f"wait-for failed to match wrapped marker: {result.stderr}"
 
@@ -371,7 +418,7 @@ class TestWaitCursorDetection:
 
     def test_wait_does_not_match_prompt_in_running_command(self, session, term_cli):
         """wait should not match prompt patterns in the command text itself.
-        
+
         This tests the cursor-based detection: when a command like 'sleep 2'
         is running, the screen shows '[user@host]$ sleep 2' but the cursor
         is on the next line waiting for output. The prompt pattern '$' appears
@@ -386,11 +433,13 @@ class TestWaitCursorDetection:
         elapsed = time.time() - start
         assert result.ok
         # Should have waited for the sleep to complete (2+ seconds)
-        assert elapsed >= 1.5, f"wait returned too quickly ({elapsed:.1f}s) - may have matched prompt in command text"
+        assert elapsed >= 1.5, (
+            f"wait returned too quickly ({elapsed:.1f}s) - may have matched prompt in command text"
+        )
 
     def test_wait_with_dollar_in_output(self, session, term_cli):
         """wait should work correctly when command output contains $.
-        
+
         Output like 'Price: $100' should not cause false prompt detection.
         """
         term_cli("send-text", "-s", session, "sleep 1 && echo 'Price: $100'", "-e")
@@ -406,11 +455,13 @@ class TestWaitCursorDetection:
 
     def test_wait_with_prompt_like_output(self, session, term_cli):
         """wait handles output that looks like a prompt.
-        
+
         Even if output ends with '$ ', we should only detect prompt
         when cursor is actually at the prompt position.
         """
-        term_cli("send-text", "-s", session, "sleep 1 && echo 'fake prompt: user$ '", "-e")
+        term_cli(
+            "send-text", "-s", session, "sleep 1 && echo 'fake prompt: user$ '", "-e"
+        )
         start = time.time()
         result = term_cli("wait", "-s", session, "-t", "5")
         elapsed = time.time() - start
@@ -419,42 +470,56 @@ class TestWaitCursorDetection:
 
     def test_wait_detects_prompt_with_status_bar_below(self, session, term_cli):
         """wait detects prompt when there's a status bar below the cursor.
-        
+
         Some programs like lldb, gdb, or custom TUIs display a prompt mid-screen
         with a status line at the bottom. The prompt detection should look at
         the cursor's line, not the last non-empty line.
-        
+
         This simulates the scenario by creating output that has a prompt-like
         line followed by a status line, with the cursor positioned at the prompt.
         """
         # Simulate a TUI-style screen: prompt on one line, status at bottom
         # We'll use a script that positions cursor on a prompt line with content below
-        term_cli("run", "-s", session, 
+        term_cli(
+            "run",
+            "-s",
+            session,
             "printf '(prompt) \\n\\n\\n\\n\\nstatus line' && sleep 0.5 && "
             "printf '\\x1b[1;10H'",  # Move cursor to row 1, col 10 (after prompt)
-            "-w", "-t", "5")
-        
+            "-w",
+            "-t",
+            "5",
+        )
+
         # Clear screen and set up the scenario more cleanly
         term_cli("run", "-s", session, "clear", "-w")
-        
+
         # Now test with Python REPL which has a clean >>> prompt
-        term_cli("run", "-s", session, "python3 -c \"print('test')\" && echo done", "-w", "-t", "5")
+        term_cli(
+            "run",
+            "-s",
+            session,
+            "python3 -c \"print('test')\" && echo done",
+            "-w",
+            "-t",
+            "5",
+        )
         result = term_cli("capture", "-s", session)
         assert "done" in result.stdout or "test" in result.stdout
 
     def test_wait_requires_space_after_prompt_char(self, session, term_cli):
         """wait requires a space after the prompt character.
-        
+
         Lines ending with prompt-like characters but no trailing space
         (like 'array[0]' or 'if (condition)') should not be detected as prompts.
         """
         # Run a command that outputs text ending with ] but no space
         term_cli("run", "-s", session, "echo 'array[0]'", "-w", "-t", "5")
-        
+
         # The shell prompt should still be detected after the command
         result = term_cli("wait", "-s", session, "-t", "3")
         assert result.ok
-        
+
         # Verify the output contains the non-prompt text
         capture = term_cli("capture", "-s", session)
         assert "array[0]" in capture.stdout
@@ -471,16 +536,19 @@ class TestWaitCursorDetection:
         """
         filler = "A" * 78
         term_cli(
-            "run", "-s", session, "-w", "-t", "5",
+            "run",
+            "-s",
+            session,
+            "-w",
+            "-t",
+            "5",
             f"export PS1='{filler}\\$ '",
             check=True,
         )
 
         term_cli("send-text", "-s", session, "echo wrap_last_col", "-e")
         result = term_cli("wait", "-s", session, "-t", "5")
-        assert result.ok, (
-            f"Prompt not detected ($ at last col): {result.stderr}"
-        )
+        assert result.ok, f"Prompt not detected ($ at last col): {result.stderr}"
         capture = term_cli("capture", "-s", session)
         assert "wrap_last_col" in capture.stdout
 
@@ -493,16 +561,19 @@ class TestWaitCursorDetection:
         """
         filler = "B" * 77
         term_cli(
-            "run", "-s", session, "-w", "-t", "5",
+            "run",
+            "-s",
+            session,
+            "-w",
+            "-t",
+            "5",
             f"export PS1='{filler}\\$ '",
             check=True,
         )
 
         term_cli("send-text", "-s", session, "echo no_wrap_78", "-e")
         result = term_cli("wait", "-s", session, "-t", "5")
-        assert result.ok, (
-            f"Prompt not detected ($ at col 77, no wrap): {result.stderr}"
-        )
+        assert result.ok, f"Prompt not detected ($ at col 77, no wrap): {result.stderr}"
         capture = term_cli("capture", "-s", session)
         assert "no_wrap_78" in capture.stdout
 
@@ -515,23 +586,26 @@ class TestWaitCursorDetection:
         """
         filler = "D" * 80
         term_cli(
-            "run", "-s", session, "-w", "-t", "5",
+            "run",
+            "-s",
+            session,
+            "-w",
+            "-t",
+            "5",
             f"export PS1='{filler}\\$ '",
             check=True,
         )
 
         term_cli("send-text", "-s", session, "echo full_line_wrap", "-e")
         result = term_cli("wait", "-s", session, "-t", "5")
-        assert result.ok, (
-            f"Prompt not detected (full line + wrap): {result.stderr}"
-        )
+        assert result.ok, f"Prompt not detected (full line + wrap): {result.stderr}"
         capture = term_cli("capture", "-s", session)
         assert "full_line_wrap" in capture.stdout
 
 
 class TestCursorAtPromptUnit:
     """Unit tests for the _cursor_at_prompt function.
-    
+
     These tests verify the prompt detection heuristic without needing actual
     REPLs or terminal sessions. The function checks if the cursor is positioned
     at a prompt by looking at character positions relative to the cursor,
@@ -542,7 +616,7 @@ class TestCursorAtPromptUnit:
     def cursor_at_prompt(self) -> Callable[..., bool]:
         """Import _cursor_at_prompt from term-cli executable."""
         from importlib.machinery import SourceFileLoader
-        
+
         term_cli_path = Path(__file__).parent.parent / "term-cli"
         loader = SourceFileLoader("term_cli_module", str(term_cli_path))
         module = loader.load_module()
@@ -556,167 +630,196 @@ class TestCursorAtPromptUnit:
         return _call
 
     # ==================== Shell Prompts ====================
-    
-    @pytest.mark.parametrize("line,cursor_x,desc", [
-        ("$ ", 2, "bash dollar"),
-        ("% ", 2, "zsh percent"),
-        ("# ", 2, "root hash"),
-        ("user@host:~$ ", 13, "bash with user@host"),
-        ("[user@host ~]$ ", 15, "bash bracketed"),
-        ("host% ", 6, "zsh with hostname"),
-        ("(venv) $ ", 9, "virtualenv bash"),
-        ("(base) % ", 9, "conda zsh"),
-    ])
+
+    @pytest.mark.parametrize(
+        "line,cursor_x,desc",
+        [
+            ("$ ", 2, "bash dollar"),
+            ("% ", 2, "zsh percent"),
+            ("# ", 2, "root hash"),
+            ("user@host:~$ ", 13, "bash with user@host"),
+            ("[user@host ~]$ ", 15, "bash bracketed"),
+            ("host% ", 6, "zsh with hostname"),
+            ("(venv) $ ", 9, "virtualenv bash"),
+            ("(base) % ", 9, "conda zsh"),
+        ],
+    )
     def test_detects_shell_prompts(self, cursor_at_prompt, line, cursor_x, desc):
         """Detect various shell prompt styles."""
         assert cursor_at_prompt(line, cursor_x), f"Failed to detect: {desc}"
 
     # ==================== Python Prompts ====================
-    
-    @pytest.mark.parametrize("line,cursor_x,desc", [
-        (">>> ", 4, "python primary"),
-        (">>>", 4, "python no trailing space"),
-        ("In [1]: ", 8, "ipython"),
-        ("In [42]: ", 9, "ipython double digit"),
-        ("In [123]: ", 10, "ipython triple digit"),
-        ("(Pdb) ", 6, "python debugger"),
-        ("(Pdb++) ", 8, "pdb++"),
-        ("ipdb> ", 6, "ipdb"),
-    ])
+
+    @pytest.mark.parametrize(
+        "line,cursor_x,desc",
+        [
+            (">>> ", 4, "python primary"),
+            (">>>", 4, "python no trailing space"),
+            ("In [1]: ", 8, "ipython"),
+            ("In [42]: ", 9, "ipython double digit"),
+            ("In [123]: ", 10, "ipython triple digit"),
+            ("(Pdb) ", 6, "python debugger"),
+            ("(Pdb++) ", 8, "pdb++"),
+            ("ipdb> ", 6, "ipdb"),
+        ],
+    )
     def test_detects_python_prompts(self, cursor_at_prompt, line, cursor_x, desc):
         """Detect Python interpreter and debugger prompts."""
         assert cursor_at_prompt(line, cursor_x), f"Failed to detect: {desc}"
 
     # ==================== JavaScript/Node Prompts ====================
-    
-    @pytest.mark.parametrize("line,cursor_x,desc", [
-        ("> ", 2, "node primary"),
-        (">", 2, "node no space"),
-        ("deno> ", 6, "deno repl"),
-        ("bun> ", 5, "bun repl"),
-    ])
+
+    @pytest.mark.parametrize(
+        "line,cursor_x,desc",
+        [
+            ("> ", 2, "node primary"),
+            (">", 2, "node no space"),
+            ("deno> ", 6, "deno repl"),
+            ("bun> ", 5, "bun repl"),
+        ],
+    )
     def test_detects_javascript_prompts(self, cursor_at_prompt, line, cursor_x, desc):
         """Detect JavaScript runtime prompts."""
         assert cursor_at_prompt(line, cursor_x), f"Failed to detect: {desc}"
 
     # ==================== Database Prompts ====================
-    
-    @pytest.mark.parametrize("line,cursor_x,desc", [
-        ("sqlite> ", 8, "sqlite"),
-        ("mysql> ", 7, "mysql"),
-        ("postgres=# ", 11, "psql superuser"),
-        ("postgres=> ", 11, "psql normal"),
-        ("mydb=# ", 7, "psql custom db"),
-        ("MariaDB [(none)]> ", 18, "mariadb"),
-        ("mongosh> ", 9, "mongodb shell"),
-        ("redis> ", 7, "redis cli"),
-        ("127.0.0.1:6379> ", 16, "redis with host"),
-    ])
+
+    @pytest.mark.parametrize(
+        "line,cursor_x,desc",
+        [
+            ("sqlite> ", 8, "sqlite"),
+            ("mysql> ", 7, "mysql"),
+            ("postgres=# ", 11, "psql superuser"),
+            ("postgres=> ", 11, "psql normal"),
+            ("mydb=# ", 7, "psql custom db"),
+            ("MariaDB [(none)]> ", 18, "mariadb"),
+            ("mongosh> ", 9, "mongodb shell"),
+            ("redis> ", 7, "redis cli"),
+            ("127.0.0.1:6379> ", 16, "redis with host"),
+        ],
+    )
     def test_detects_database_prompts(self, cursor_at_prompt, line, cursor_x, desc):
         """Detect database client prompts."""
         assert cursor_at_prompt(line, cursor_x), f"Failed to detect: {desc}"
 
     # ==================== Debugger Prompts ====================
-    
-    @pytest.mark.parametrize("line,cursor_x,desc", [
-        ("(lldb) ", 7, "lldb"),
-        ("(gdb) ", 6, "gdb"),
-        ("(rr) ", 5, "rr debugger"),
-        ("  DB<1> ", 8, "perl debugger"),
-        ("  DB<42> ", 9, "perl debugger double digit"),
-        ("(byebug) ", 9, "ruby byebug"),
-        ("(pry) ", 6, "ruby pry"),
-        ("[0] pry(main)> ", 15, "pry with context"),
-    ])
+
+    @pytest.mark.parametrize(
+        "line,cursor_x,desc",
+        [
+            ("(lldb) ", 7, "lldb"),
+            ("(gdb) ", 6, "gdb"),
+            ("(rr) ", 5, "rr debugger"),
+            ("  DB<1> ", 8, "perl debugger"),
+            ("  DB<42> ", 9, "perl debugger double digit"),
+            ("(byebug) ", 9, "ruby byebug"),
+            ("(pry) ", 6, "ruby pry"),
+            ("[0] pry(main)> ", 15, "pry with context"),
+        ],
+    )
     def test_detects_debugger_prompts(self, cursor_at_prompt, line, cursor_x, desc):
         """Detect debugger prompts."""
         assert cursor_at_prompt(line, cursor_x), f"Failed to detect: {desc}"
 
     # ==================== Language REPL Prompts ====================
-    
-    @pytest.mark.parametrize("line,cursor_x,desc", [
-        ("> ", 2, "lua"),
-        (">> ", 3, "lua continuation"),
-        ("irb(main):001:0> ", 17, "ruby irb"),
-        ("irb(main):042:1> ", 17, "ruby irb nested"),
-        (">> ", 3, "ruby irb simple"),
-        ("scala> ", 7, "scala"),
-        ("groovy:000> ", 12, "groovy"),
-        ("ghci> ", 6, "haskell ghci"),
-        ("Prelude> ", 9, "haskell prelude"),
-        ("iex(1)> ", 8, "elixir"),
-        ("iex(42)> ", 9, "elixir double digit"),
-        ("ex(1)> ", 7, "erlang"),
-        ("1> ", 3, "erlang numbered"),
-        ("php > ", 6, "php interactive"),
-        (">>> ", 4, "php psysh"),
-        ("R> ", 3, "r language"),
-        ("> ", 2, "r primary"),
-        ("julia> ", 7, "julia"),
-        ("ocaml# ", 7, "ocaml"),
-        ("# ", 2, "ocaml utop"),
-        ("swift> ", 7, "swift repl"),
-        ("jshell> ", 8, "java jshell"),
-        ("clj꞉user꞉> ", 11, "clojure"),
-        ("user=> ", 7, "clojure lein"),
-    ])
-    def test_detects_language_repl_prompts(self, cursor_at_prompt, line, cursor_x, desc):
+
+    @pytest.mark.parametrize(
+        "line,cursor_x,desc",
+        [
+            ("> ", 2, "lua"),
+            (">> ", 3, "lua continuation"),
+            ("irb(main):001:0> ", 17, "ruby irb"),
+            ("irb(main):042:1> ", 17, "ruby irb nested"),
+            (">> ", 3, "ruby irb simple"),
+            ("scala> ", 7, "scala"),
+            ("groovy:000> ", 12, "groovy"),
+            ("ghci> ", 6, "haskell ghci"),
+            ("Prelude> ", 9, "haskell prelude"),
+            ("iex(1)> ", 8, "elixir"),
+            ("iex(42)> ", 9, "elixir double digit"),
+            ("ex(1)> ", 7, "erlang"),
+            ("1> ", 3, "erlang numbered"),
+            ("php > ", 6, "php interactive"),
+            (">>> ", 4, "php psysh"),
+            ("R> ", 3, "r language"),
+            ("> ", 2, "r primary"),
+            ("julia> ", 7, "julia"),
+            ("ocaml# ", 7, "ocaml"),
+            ("# ", 2, "ocaml utop"),
+            ("swift> ", 7, "swift repl"),
+            ("jshell> ", 8, "java jshell"),
+            ("clj꞉user꞉> ", 11, "clojure"),
+            ("user=> ", 7, "clojure lein"),
+        ],
+    )
+    def test_detects_language_repl_prompts(
+        self, cursor_at_prompt, line, cursor_x, desc
+    ):
         """Detect various language REPL prompts."""
         assert cursor_at_prompt(line, cursor_x), f"Failed to detect: {desc}"
 
     # ==================== Other Tool Prompts ====================
-    
-    @pytest.mark.parametrize("line,cursor_x,desc", [
-        ("ftp> ", 5, "ftp client"),
-        ("sftp> ", 6, "sftp client"),
-        ("telnet> ", 8, "telnet"),
-        ("(gcloud) $ ", 11, "gcloud shell"),
-        (">>> ", 4, "aws cloudshell"),
-        ("kubectl> ", 9, "kubectl shell"),
-        ("nix-shell> ", 11, "nix shell"),
-        ("bash-5.1$ ", 10, "bash version"),
-        ("zsh-5.8% ", 9, "zsh version"),
-        ("sh-5.1$ ", 8, "sh version"),
-    ])
+
+    @pytest.mark.parametrize(
+        "line,cursor_x,desc",
+        [
+            ("ftp> ", 5, "ftp client"),
+            ("sftp> ", 6, "sftp client"),
+            ("telnet> ", 8, "telnet"),
+            ("(gcloud) $ ", 11, "gcloud shell"),
+            (">>> ", 4, "aws cloudshell"),
+            ("kubectl> ", 9, "kubectl shell"),
+            ("nix-shell> ", 11, "nix shell"),
+            ("bash-5.1$ ", 10, "bash version"),
+            ("zsh-5.8% ", 9, "zsh version"),
+            ("sh-5.1$ ", 8, "sh version"),
+        ],
+    )
     def test_detects_other_tool_prompts(self, cursor_at_prompt, line, cursor_x, desc):
         """Detect other tool and client prompts."""
         assert cursor_at_prompt(line, cursor_x), f"Failed to detect: {desc}"
 
     # ==================== Edge Cases That Should Match ====================
-    
-    @pytest.mark.parametrize("line,cursor_x,desc", [
-        ("$", 2, "bare dollar, cursor past end"),
-        (">", 2, "bare gt, cursor past end"),
-        ("#", 2, "bare hash, cursor past end"),
-        ("$ \t", 2, "prompt with tab after space"),
-        (">\t", 2, "prompt with only tab"),
-    ])
+
+    @pytest.mark.parametrize(
+        "line,cursor_x,desc",
+        [
+            ("$", 2, "bare dollar, cursor past end"),
+            (">", 2, "bare gt, cursor past end"),
+            ("#", 2, "bare hash, cursor past end"),
+            ("$ \t", 2, "prompt with tab after space"),
+            (">\t", 2, "prompt with only tab"),
+        ],
+    )
     def test_edge_cases_that_match(self, cursor_at_prompt, line, cursor_x, desc):
         """Edge cases that should still be detected as prompts."""
         assert cursor_at_prompt(line, cursor_x), f"Failed to detect: {desc}"
 
     # ==================== Non-Prompts That Should Be Rejected ====================
-    
-    @pytest.mark.parametrize("line,cursor_x,desc", [
-        ("hello world", 11, "plain text"),
-        ("Price: $100 ", 12, "dollar in text"),
-        ("$100", 4, "dollar amount"),
-        ("x = 1; ", 7, "code with semicolon"),
-        ("foo: bar ", 9, "key-value pair"),
-        ("=> value ", 9, "fat arrow"),
-        ("-> result ", 10, "thin arrow"),
-        ("", 0, "empty line"),
-        ("", 2, "empty line cursor past end"),
-        ("$", 0, "cursor at position 0"),
-        ("$", 1, "cursor at position 1"),
-        ("a", 1, "single char no prompt"),
-        ("ab", 2, "two chars no prompt"),
-        ("no prompt here", 14, "sentence"),
-        ("function() {", 12, "code"),
-        ("return value;", 13, "return statement"),
-        ("... ", 4, "ellipsis continuation"),
-        ("+ ", 2, "plus continuation"),
-    ])
+
+    @pytest.mark.parametrize(
+        "line,cursor_x,desc",
+        [
+            ("hello world", 11, "plain text"),
+            ("Price: $100 ", 12, "dollar in text"),
+            ("$100", 4, "dollar amount"),
+            ("x = 1; ", 7, "code with semicolon"),
+            ("foo: bar ", 9, "key-value pair"),
+            ("=> value ", 9, "fat arrow"),
+            ("-> result ", 10, "thin arrow"),
+            ("", 0, "empty line"),
+            ("", 2, "empty line cursor past end"),
+            ("$", 0, "cursor at position 0"),
+            ("$", 1, "cursor at position 1"),
+            ("a", 1, "single char no prompt"),
+            ("ab", 2, "two chars no prompt"),
+            ("no prompt here", 14, "sentence"),
+            ("function() {", 12, "code"),
+            ("return value;", 13, "return statement"),
+            ("... ", 4, "ellipsis continuation"),
+            ("+ ", 2, "plus continuation"),
+        ],
+    )
     def test_rejects_non_prompts(self, cursor_at_prompt, line, cursor_x, desc):
         """Non-prompt patterns that should be rejected."""
         assert not cursor_at_prompt(line, cursor_x), f"Should reject: {desc}"
@@ -725,22 +828,25 @@ class TestCursorAtPromptUnit:
     # These patterns match our simple heuristic but aren't real prompts.
     # In practice, the stability check filters these out since real output
     # continues flowing, while prompts are stable.
-    
-    @pytest.mark.parametrize("line,cursor_x,desc", [
-        ("Processing (step 1) ", 20, "output ending with )"),
-        ("foo) ", 5, "random ) at end"),
-        ("result: 42) ", 12, "number before )"),
-        ("array[0] ", 9, "array access with ]"),
-        ("if (x > 0) ", 11, "code ending with )"),
-        (") ) ", 4, "multiple ) with spaces"),
-        ("hello world> ", 13, "text ending with >"),
-        ("foo:bar> ", 9, "text with colon before >"),
-        ("dict['key'] ", 12, "dict access"),
-        ("(done) ", 7, "word in parens"),
-    ])
+
+    @pytest.mark.parametrize(
+        "line,cursor_x,desc",
+        [
+            ("Processing (step 1) ", 20, "output ending with )"),
+            ("foo) ", 5, "random ) at end"),
+            ("result: 42) ", 12, "number before )"),
+            ("array[0] ", 9, "array access with ]"),
+            ("if (x > 0) ", 11, "code ending with )"),
+            (") ) ", 4, "multiple ) with spaces"),
+            ("hello world> ", 13, "text ending with >"),
+            ("foo:bar> ", 9, "text with colon before >"),
+            ("dict['key'] ", 12, "dict access"),
+            ("(done) ", 7, "word in parens"),
+        ],
+    )
     def test_known_false_positives(self, cursor_at_prompt, line, cursor_x, desc):
         """Patterns that match but aren't prompts (stability check handles these).
-        
+
         These are documented limitations of the simple cursor-relative heuristic.
         The full wait command uses a stability check to filter these out in practice.
         """
@@ -751,31 +857,177 @@ class TestCursorAtPromptUnit:
         )
 
     # ==================== Wrap Edge Cases ====================
+    #
+    # When cursor_x < 2 the underflow algorithm looks back into the
+    # previous line using pane_width.  For a genuine wrap, the previous
+    # line fills the entire pane (len == pane_width with -N capture).
+    # Positions beyond the captured content are treated as implicit
+    # spaces (unwritten terminal cells).
 
-    @pytest.mark.parametrize("prev_line,cursor_x,expected,desc", [
-        ("user@host:~$", 0, True, "dollar at end, cursor wraps to x=0"),
-        ("user@host:~$", 1, True, "dollar at end, cursor wraps to x=1"),
-        ("long-prompt#", 0, True, "hash at end, cursor wraps to x=0"),
-        ("long-prompt%", 1, True, "percent at end, cursor wraps to x=1"),
-        ("long-prompt>", 0, True, "gt at end, cursor wraps to x=0"),
-        ("no-prompt-char", 0, False, "prev line has no prompt char"),
-        ("", 0, False, "prev line is empty"),
-        ("text ending with space ", 0, False, "prev line ends with space"),
-    ])
-    def test_wrap_cases(self, cursor_at_prompt, prev_line, cursor_x, expected, desc):
+    @pytest.mark.parametrize(
+        "prev_line,cursor_line,cursor_x,pane_width,expected,desc",
+        [
+            # Wrap A: prompt_char at W-2, space at W-1, cursor wraps to x=0.
+            # The line fills the entire pane width so len == pane_width.
+            (
+                "user@host:~$ ",
+                "",
+                0,
+                13,
+                True,
+                "dollar + space at end, cursor wraps to x=0",
+            ),
+            (
+                "long-prompt# ",
+                "",
+                0,
+                13,
+                True,
+                "hash + space at end, cursor wraps to x=0",
+            ),
+            (
+                "long-prompt> ",
+                "",
+                0,
+                13,
+                True,
+                "gt + space at end, cursor wraps to x=0",
+            ),
+            # Wrap B: prompt_char at W-1 (pane edge), space+cursor on next line.
+            # len(prev_line) == pane_width, cursor_x == 1, gap at cursor_line[0].
+            (
+                "user@host:~$",
+                " ",
+                1,
+                12,
+                True,
+                "dollar at end, space+cursor wraps to x=1",
+            ),
+            (
+                "long-prompt%",
+                " ",
+                1,
+                12,
+                True,
+                "percent at end, space+cursor wraps to x=1",
+            ),
+            # Rejection: prev line doesn't end with prompt char.
+            ("no-prompt-char ", "", 0, 15, False, "prev line has no prompt char"),
+            # Rejection: empty previous line.
+            ("", "", 0, 80, False, "prev line is empty"),
+            # Rejection: prev line ends with space (gap) but char before is not
+            # a prompt char — e.g. regular text that happened to fill the pane.
+            (
+                "text ending with space ",
+                "",
+                0,
+                22,
+                False,
+                "prev line ends with space but no prompt char",
+            ),
+            # Rejection: prev line doesn't fill the pane — cursor moved via
+            # newline, not wrap.  This is the core pytest false-positive fix.
+            (
+                "user@host:~$ ",
+                "",
+                0,
+                80,
+                False,
+                "prev line shorter than pane width, not a wrap",
+            ),
+            (
+                "long-prompt>",
+                " ",
+                1,
+                80,
+                False,
+                "prev line shorter than pane width, cursor_x=1",
+            ),
+        ],
+    )
+    def test_wrap_cases(
+        self,
+        cursor_at_prompt,
+        prev_line,
+        cursor_line,
+        cursor_x,
+        pane_width,
+        expected,
+        desc,
+    ):
         """Prompt char at end of previous line, cursor wrapped to next line."""
         fn = cursor_at_prompt.raw
-        lines = [prev_line, ""]
-        assert fn(lines, cursor_x, 1) == expected, f"wrap case: {desc}"
+        lines = [prev_line, cursor_line]
+        assert fn(lines, cursor_x, 1, pane_width=pane_width) == expected, (
+            f"wrap case: {desc}"
+        )
 
     def test_wrap_no_previous_line(self, cursor_at_prompt):
         """Cursor at x=0, y=0 — no previous line to check."""
         fn = cursor_at_prompt.raw
-        assert not fn([""], 0, 0)
+        assert not fn([""], 0, 0, pane_width=80)
 
     def test_wrap_ignored_when_cursor_x_ge_2(self, cursor_at_prompt):
         """Wrap logic only applies when cursor_x <= 1."""
         fn = cursor_at_prompt.raw
         lines = ["user@host:~$", "   "]
         # cursor_x=3 on line 1 — should use normal check, not wrap
-        assert not fn(lines, 3, 1)
+        assert not fn(lines, 3, 1, pane_width=12)
+
+    # ==================== Pytest Progress Bar False Positives ====================
+
+    @pytest.mark.parametrize(
+        "prev_line,cursor_x,pane_width,desc",
+        [
+            # The main reported false positive: pytest -q progress lines end with ]
+            # from the [ NN%] indicator.  The cursor moves to the next line via a
+            # newline, NOT a terminal wrap.  Must be rejected.
+            (
+                "..................................[ 71%]",
+                0,
+                80,
+                "pytest progress shorter than pane width",
+            ),
+            (
+                "..................................[ 71%]",
+                0,
+                120,
+                "pytest progress on wide terminal",
+            ),
+            # Line exactly fills pane width — ] at last column, cursor wraps to x=0.
+            # NOT a prompt wrap: wrap A requires len == W-1 (stripped space), and
+            # wrap B requires cursor_x == 1.  len == W with cursor_x == 0 is neither.
+            (
+                "." * 73 + "[ 100%]",
+                0,
+                80,
+                "pytest progress fills 80-col terminal exactly",
+            ),
+            # Line length == pane_width - 1.  One char short of filling the
+            # pane, so the underflow gate (len == pane_width) rejects it.
+            ("." * 72 + "[ 100%]", 0, 80, "pytest progress len == pane_width - 1"),
+        ],
+    )
+    def test_rejects_pytest_progress_false_positives(
+        self,
+        cursor_at_prompt,
+        prev_line,
+        cursor_x,
+        pane_width,
+        desc,
+    ):
+        """Pytest progress indicator [ NN%] ends with ] which is in PROMPT_CHARS.
+
+        The cursor moves to the next line via newline, not terminal wrap.
+        The underflow algorithm rejects these because the previous line is
+        shorter than pane_width, so the line-boundary crossing is refused
+        (a wrap requires the line to fill the entire pane).
+
+        Regression test for: term-cli wait --timeout 180 false positive at
+        44.9s during a pytest -n auto -q run, triggered by [ 71%] output.
+        """
+        fn = cursor_at_prompt.raw
+        lines = [prev_line, ""]
+        assert not fn(lines, cursor_x, 1, pane_width=pane_width), (
+            f"Should reject pytest output as prompt: {desc}"
+        )

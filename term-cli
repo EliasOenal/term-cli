@@ -120,7 +120,7 @@ POLL_INTERVAL_MULTIPLIER = 1.2   # Factor to increase poll interval each iterati
 # Prompt detection configuration
 PROMPT_CHARS = frozenset('$%#>)]:')  # Characters that indicate end of prompt
 STABILITY_SAMPLES = 3                 # Number of samples for stability check
-STABILITY_INTERVAL = 0.05             # Interval between stability samples (50ms)
+STABILITY_INTERVAL = 0.1              # Interval between stability samples (100ms)
 
 # tmux user option for human assistance requests (using @ prefix for user options)
 # User options can be used directly in tmux format strings with #{@name} syntax
@@ -294,7 +294,8 @@ def _get_pane_dimensions(session: str) -> tuple[int, int]:
         return (DEFAULT_COLS, DEFAULT_ROWS)
 
 def _capture_screen(session: str, trim: bool = True, raw: bool = False, 
-                    join_wrapped: bool = False) -> str:
+                    join_wrapped: bool = False,
+                    preserve_trailing: bool = False) -> str:
     """Capture only the visible screen content (not scrollback).
     
     Args:
@@ -304,6 +305,10 @@ def _capture_screen(session: str, trim: bool = True, raw: bool = False,
         join_wrapped: Join wrapped lines (-J flag). Default False to preserve
                       physical screen layout. Set True for logical line capture
                       (e.g., scrollback).
+        preserve_trailing: Preserve trailing spaces at each line's end (-N flag).
+                           When True, wrapped lines will have len == pane_width
+                           while non-wrapped lines will be shorter, allowing
+                           reliable wrap detection.  Implies trim=False.
     """
     # -p prints to stdout, -J joins wrapped lines, -e includes escape sequences (colors)
     tmux_args = ["capture-pane", "-p", "-t", _exact(session)]
@@ -311,11 +316,13 @@ def _capture_screen(session: str, trim: bool = True, raw: bool = False,
         tmux_args.insert(2, "-J")
     if raw:
         tmux_args.insert(2, "-e")  # Add -e flag for escape sequences
+    if preserve_trailing:
+        tmux_args.insert(2, "-N")
     res = _run_tmux(tmux_args)
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to capture pane")
     output = res.stdout
-    if trim:
+    if trim and not preserve_trailing:
         output = _trim_output(output)
     return output
 
@@ -420,37 +427,61 @@ def _clear_alert_flags(session: str) -> None:
     """Clear bell/activity/silence alert flags on the session."""
     _run_tmux(["kill-session", "-C", "-t", _exact(session)])
 
-def _cursor_at_prompt(lines: list[str], cursor_x: int, cursor_y: int) -> bool:
+def _cursor_at_prompt(lines: list[str], cursor_x: int, cursor_y: int,
+                      pane_width: int = 0) -> bool:
     """Check if the cursor is positioned at a shell prompt.
 
-    Looks for the pattern ``prompt_char + space + cursor`` on the cursor's
-    line.  Also handles the wrap edge-case: when the prompt character lands
-    at the last terminal column, the trailing space (and cursor) wrap to the
-    next physical line.  In that case the prompt char is the last character
-    of the *previous* line.
+    Detects the pattern ``prompt_char + whitespace_gap + cursor`` by looking
+    at the two character positions immediately before the cursor.  When a
+    lookback crosses a line boundary (``cursor_x < 2``), it underflows into
+    the previous line using ``pane_width`` to compute the column — but only
+    if the previous line actually filled the pane width, since a terminal
+    wrap can only occur when a line reaches the last column.
+
+    The caller should capture with ``-N`` (preserve trailing spaces) so that
+    real whitespace at the pane edge is retained in the capture.  Positions
+    beyond the captured line content are treated as implicit spaces (empty
+    terminal cells).
+
+    ``pane_width`` is required for line-boundary underflow (must be > 0).
+    When unavailable, only the simple case (``cursor_x >= 2``) is checked.
 
     Matches prompts like ``"$ "``, ``"(lldb) "``, ``">>> "``.
     """
-    if cursor_y >= len(lines):
+
+    def _char_at(x: int, y: int) -> str | None:
+        """Return the character at terminal position (x, y).
+
+        If *x* is negative the position underflows into the previous line
+        using *pane_width*.  The previous line must have ``len == pane_width``
+        (i.e. it filled the pane) because a terminal line can only wrap when
+        all columns are occupied.  Positions beyond the captured line content
+        return ``' '`` (implicit empty terminal cell).
+        """
+        if x < 0:
+            if pane_width <= 0:
+                return None
+            y -= 1
+            if y < 0 or y >= len(lines):
+                return None
+            # A line only wraps when it fills the entire pane width.
+            if len(lines[y]) != pane_width:
+                return None
+            x += pane_width
+            return lines[y][x] if x < len(lines[y]) else ' '
+        if y < 0 or y >= len(lines):
+            return None
+        line = lines[y]
+        return line[x] if x < len(line) else ' '
+
+    gap_char = _char_at(cursor_x - 1, cursor_y)
+    prompt_char = _char_at(cursor_x - 2, cursor_y)
+
+    if prompt_char is None or gap_char is None:
         return False
-    cursor_line = lines[cursor_y]
-
-    # Normal case: "prompt_char + space + cursor" on the same line.
-    if cursor_x >= 2:
-        if cursor_x - 1 < len(cursor_line):
-            if cursor_line[cursor_x - 1] not in " \t":
-                return False  # non-whitespace immediately left of cursor
-        if cursor_x - 2 < len(cursor_line) and cursor_line[cursor_x - 2] in PROMPT_CHARS:
-            return True
-
-    # Wrap case: prompt char at the last column of the previous line,
-    # trailing space + cursor wrapped to x=0 or x=1 on this line.
-    if cursor_x <= 1 and cursor_y > 0:
-        prev_line = lines[cursor_y - 1]
-        if prev_line and prev_line[-1] in PROMPT_CHARS:
-            return True
-
-    return False
+    if gap_char not in " \t":
+        return False
+    return prompt_char in PROMPT_CHARS
 
 
 def _check_stability(session: str) -> bool:
@@ -484,8 +515,10 @@ def _is_at_prompt(session: str) -> bool:
     - Debuggers with status bars (lldb, gdb) where prompt is above status line
     - Avoids false positives from scrolling output containing prompt-like chars
     """
-    # Use join_wrapped=False so line numbers match cursor position
-    screen = _capture_screen(session, trim=False, join_wrapped=False)
+    # Use -N (preserve trailing spaces) so that wrapped lines have
+    # len == pane_width while non-wrapped lines are shorter.  This lets
+    # _cursor_at_prompt reliably distinguish wraps from newlines.
+    screen = _capture_screen(session, preserve_trailing=True, join_wrapped=False)
     if not screen:
         return False
     
@@ -496,7 +529,9 @@ def _is_at_prompt(session: str) -> bool:
     
     lines = screen.split('\n')
     
-    if not _cursor_at_prompt(lines, cursor_x, cursor_y):
+    pane_width, _ = _get_pane_dimensions(session)
+    
+    if not _cursor_at_prompt(lines, cursor_x, cursor_y, pane_width=pane_width):
         return False
     
     # Stability check: screen must remain unchanged across multiple samples

@@ -106,6 +106,7 @@ from typing import Any
 
 DEFAULT_COLS = 80
 DEFAULT_ROWS = 24
+DEFAULT_HISTORY_LIMIT = 50000
 DEFAULT_WAIT_TIMEOUT = 10.0
 DEFAULT_IDLE_SECONDS = 2.0
 DEFAULT_IDLE_TIMEOUT = 10.0
@@ -2490,6 +2491,10 @@ def cmd_start(args: argparse.Namespace) -> None:
     # (default: "latest") would resize the window whenever a client
     # attaches to *any* session on the same server.
     _run_tmux(["set-option", "-t", _exact(session), "window-size", "manual"])
+
+    # Increase scrollback buffer so agents don't lose important output.
+    # tmux default is 2000 lines which is easily exceeded by verbose builds.
+    _run_tmux(["set-option", "-t", _exact(session), "history-limit", str(DEFAULT_HISTORY_LIMIT)])
 
     # Set locked flag if requested
     if args.locked:

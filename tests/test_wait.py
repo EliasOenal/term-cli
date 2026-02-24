@@ -510,10 +510,11 @@ class TestWaitCursorDetection:
     def test_wait_requires_space_after_prompt_char(self, session, term_cli):
         """wait requires a space after the prompt character.
 
-        Lines ending with prompt-like characters but no trailing space
-        (like 'array[0]' or 'if (condition)') should not be detected as prompts.
+        Lines ending with non-prompt characters (like 'array[0]' where ] is
+        not in PROMPT_CHARS) or prompt chars without trailing space (like
+        'if (condition)') should not be detected as prompts.
         """
-        # Run a command that outputs text ending with ] but no space
+        # Run a command that outputs text ending with ] (not a prompt char)
         term_cli("run", "-s", session, "echo 'array[0]'", "-w", "-t", "5")
 
         # The shell prompt should still be detected after the command
@@ -818,6 +819,8 @@ class TestCursorAtPromptUnit:
             ("return value;", 13, "return statement"),
             ("... ", 4, "ellipsis continuation"),
             ("+ ", 2, "plus continuation"),
+            ("array[0] ", 9, "array access with ]"),
+            ("dict['key'] ", 12, "dict access with ]"),
         ],
     )
     def test_rejects_non_prompts(self, cursor_at_prompt, line, cursor_x, desc):
@@ -835,12 +838,10 @@ class TestCursorAtPromptUnit:
             ("Processing (step 1) ", 20, "output ending with )"),
             ("foo) ", 5, "random ) at end"),
             ("result: 42) ", 12, "number before )"),
-            ("array[0] ", 9, "array access with ]"),
             ("if (x > 0) ", 11, "code ending with )"),
             (") ) ", 4, "multiple ) with spaces"),
             ("hello world> ", 13, "text ending with >"),
             ("foo:bar> ", 9, "text with colon before >"),
-            ("dict['key'] ", 12, "dict access"),
             ("(done) ", 7, "word in parens"),
         ],
     )
@@ -976,39 +977,61 @@ class TestCursorAtPromptUnit:
 
     # ==================== Pytest Progress Bar False Positives ====================
 
+    def test_rejects_pytest_progress_bracket(self, cursor_at_prompt):
+        """Pytest progress like '[ 71%]' must not trigger prompt detection.
+
+        Regression test for: term-cli wait --timeout 180 false positive at
+        44.9s during a pytest -n auto -q run, triggered by [ 71%] output.
+        The fix was removing ] from PROMPT_CHARS — no default shell, REPL,
+        or debugger uses ] as the terminal prompt character.
+        """
+        fn = cursor_at_prompt.raw
+        prev_line = "..................................[ 71%]"
+        lines = [prev_line, ""]
+        assert not fn(lines, 0, 1, pane_width=80), (
+            "Should reject pytest progress output as prompt"
+        )
+
     @pytest.mark.parametrize(
         "prev_line,cursor_x,pane_width,desc",
         [
-            # The main reported false positive: pytest -q progress lines end with ]
-            # from the [ NN%] indicator.  The cursor moves to the next line via a
-            # newline, NOT a terminal wrap.  Must be rejected.
+            # Output ending with ) followed by a newline (cursor at x=0 on next
+            # line).  ) IS in PROMPT_CHARS, so the underflow/wrap heuristic is
+            # the only defense.  These must all be rejected because the cursor
+            # reached x=0 via a newline, not a terminal wrap.
             (
-                "..................................[ 71%]",
+                "..................................( 71%)",
                 0,
                 80,
-                "pytest progress shorter than pane width",
+                "output with ) shorter than pane width",
             ),
             (
-                "..................................[ 71%]",
+                "..................................( 71%)",
                 0,
                 120,
-                "pytest progress on wide terminal",
+                "output with ) on wide terminal",
             ),
-            # Line exactly fills pane width — ] at last column, cursor wraps to x=0.
-            # NOT a prompt wrap: wrap A requires len == W-1 (stripped space), and
-            # wrap B requires cursor_x == 1.  len == W with cursor_x == 0 is neither.
+            # Line exactly fills pane width — ) at last column, cursor wraps to
+            # x=0.  NOT a prompt wrap: wrap A requires len == W-1 (stripped
+            # trailing space), and wrap B requires cursor_x == 1.  len == W with
+            # cursor_x == 0 is neither.
             (
-                "." * 73 + "[ 100%]",
+                "." * 73 + "( 100%)",
                 0,
                 80,
-                "pytest progress fills 80-col terminal exactly",
+                "output with ) fills 80-col terminal exactly",
             ),
             # Line length == pane_width - 1.  One char short of filling the
             # pane, so the underflow gate (len == pane_width) rejects it.
-            ("." * 72 + "[ 100%]", 0, 80, "pytest progress len == pane_width - 1"),
+            (
+                "." * 72 + "( 100%)",
+                0,
+                80,
+                "output with ) len == pane_width - 1",
+            ),
         ],
     )
-    def test_rejects_pytest_progress_false_positives(
+    def test_rejects_paren_output_at_various_widths(
         self,
         cursor_at_prompt,
         prev_line,
@@ -1016,18 +1039,15 @@ class TestCursorAtPromptUnit:
         pane_width,
         desc,
     ):
-        """Pytest progress indicator [ NN%] ends with ] which is in PROMPT_CHARS.
+        """Output ending with ) at various pane widths must not false-positive.
 
-        The cursor moves to the next line via newline, not terminal wrap.
-        The underflow algorithm rejects these because the previous line is
-        shorter than pane_width, so the line-boundary crossing is refused
-        (a wrap requires the line to fill the entire pane).
-
-        Regression test for: term-cli wait --timeout 180 false positive at
-        44.9s during a pytest -n auto -q run, triggered by [ 71%] output.
+        ) is in PROMPT_CHARS, so these cases exercise the underflow/wrap
+        heuristic that distinguishes "cursor moved to next line via newline"
+        from "cursor wrapped because the line filled the terminal."  Each
+        parametrized case hits a distinct rejection path.
         """
         fn = cursor_at_prompt.raw
         lines = [prev_line, ""]
         assert not fn(lines, cursor_x, 1, pane_width=pane_width), (
-            f"Should reject pytest output as prompt: {desc}"
+            f"Should reject output ending with ) as prompt: {desc}"
         )

@@ -10,6 +10,7 @@ AGENTS.md § "Nested tmux testing pattern" for details.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,11 +30,15 @@ def _run_term_assist(*args: str, socket: str | None = None) -> RunResult:
     if socket:
         # Insert socket option at the beginning
         full_args = ["-L", socket] + full_args
+    # Strip TMUX from environment so tests behave as "outside tmux" even
+    # when the test runner itself is inside a term-cli / tmux session.
+    env = {k: v for k, v in os.environ.items() if k != "TMUX"}
     proc = subprocess.run(
         [sys.executable, str(TERM_ASSIST), *full_args],
         capture_output=True,
         text=True,
         timeout=30,
+        env=env,
     )
     return RunResult(
         returncode=proc.returncode,
@@ -126,22 +131,30 @@ class TestCommandAbbreviation:
 
     def test_abbreviation_st_for_start(self):
         """'st' abbreviates to 'start'.
-        
+
         This test uses its own isolated tmux socket to avoid flakiness from
         parallel test interference with session creation.
         """
         import subprocess
         import sys
-        
+
         socket = f"pytest_st_abbrev_{unique_session_name()}"
         session = unique_session_name()
         term_assist_path = Path(__file__).parent.parent / "term-assist"
         term_cli_path = Path(__file__).parent.parent / "term-cli"
-        
+
         try:
             # Run term-assist start with abbreviated command
             result = subprocess.run(
-                [sys.executable, str(term_assist_path), "-L", socket, "st", "-s", session],
+                [
+                    sys.executable,
+                    str(term_assist_path),
+                    "-L",
+                    socket,
+                    "st",
+                    "-s",
+                    session,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -162,7 +175,9 @@ class TestCommandAbbreviation:
         # 'd' could be 'done', 'detach', etc.
         result = _run_term_assist("d")
         assert not result.ok
-        assert "ambiguous" in result.stderr.lower() or "could be" in result.stderr.lower()
+        assert (
+            "ambiguous" in result.stderr.lower() or "could be" in result.stderr.lower()
+        )
 
 
 class TestList:
@@ -172,7 +187,7 @@ class TestList:
         """List shows sessions with pending requests."""
         # Create a request
         term_cli("request", "-s", session, "-m", "Test request message")
-        
+
         result = term_assist("list")
         assert result.ok
         assert session in result.stdout
@@ -213,15 +228,15 @@ class TestDone:
         """Done clears a pending request."""
         # Create a request
         term_cli("request", "-s", session, "-m", "Need help")
-        
+
         # Verify it's pending
         status = term_cli("request-status", "-s", session)
         assert status.returncode == 0  # pending
-        
+
         # Mark done via term-assist
         result = term_assist("done", "-s", session)
         assert result.ok
-        
+
         # Verify it's cleared
         status = term_cli("request-status", "-s", session)
         assert status.returncode == 1  # not pending
@@ -230,7 +245,10 @@ class TestDone:
         """Done on nonexistent session fails."""
         result = term_assist("done", "-s", "nonexistent_session_xyz_123")
         assert not result.ok
-        assert "does not exist" in result.stderr.lower() or "not found" in result.stderr.lower()
+        assert (
+            "does not exist" in result.stderr.lower()
+            or "not found" in result.stderr.lower()
+        )
 
 
 class TestStart:
@@ -243,7 +261,7 @@ class TestStart:
             result = term_assist("start", "-s", session)
             assert result.ok
             assert session in result.stdout
-            
+
             # Verify session exists via term-cli
             status = term_cli("status", "-s", session)
             assert status.ok
@@ -267,7 +285,7 @@ class TestStart:
         try:
             result = term_assist("start", "-s", session, "-c", str(tmp_path))
             assert result.ok
-            
+
             # Verify cwd
             term_cli("run", "-s", session, "pwd", "-w")
             capture = term_cli("capture", "-s", session, "-n", "50")
@@ -291,7 +309,7 @@ class TestStart:
 
 class TestAttachSessionResolution:
     """Tests for attach command's session resolution logic.
-    
+
     Note: We can't test actual attach (uses execvp), but we can test
     the error messages which reveal the resolution logic.
     """
@@ -302,19 +320,21 @@ class TestAttachSessionResolution:
         assert not result.ok
         assert "does not exist" in result.stderr.lower()
 
-    def test_attach_prefers_session_with_request(self, term_cli, term_assist, tmux_socket):
+    def test_attach_prefers_session_with_request(
+        self, term_cli, term_assist, tmux_socket
+    ):
         """Attach without -s prefers session with pending request."""
         session1 = unique_session_name()
         session2 = unique_session_name()
-        
+
         try:
             # Create two sessions
             term_cli("start", "-s", session1)
             term_cli("start", "-s", session2)
-            
+
             # Add request to session2 only
             term_cli("request", "-s", session2, "-m", "Help needed")
-            
+
             # Try to attach without -s
             # It will fail at execvp, but the stderr should show which session it picked
             result = term_assist("attach")
@@ -345,17 +365,17 @@ class TestIntegrationWithTermCli:
         # Agent requests help
         req = term_cli("request", "-s", session, "-m", "Please enter password")
         assert req.ok
-        
+
         # Human sees the request
         list_result = term_assist("list")
         assert list_result.ok
         assert session in list_result.stdout
         assert "Please enter password" in list_result.stdout
-        
+
         # Human marks it done (without actually attaching)
         done_result = term_assist("done", "-s", session)
         assert done_result.ok
-        
+
         # Agent's request-wait would now return (but we can verify via status)
         status = term_cli("request-status", "-s", session)
         assert status.returncode == 1  # not pending
@@ -364,14 +384,14 @@ class TestIntegrationWithTermCli:
         """Multiple sessions with requests are all listed."""
         session1 = unique_session_name()
         session2 = unique_session_name()
-        
+
         try:
             term_cli("start", "-s", session1)
             term_cli("start", "-s", session2)
-            
+
             term_cli("request", "-s", session1, "-m", "Help with session 1")
             term_cli("request", "-s", session2, "-m", "Help with session 2")
-            
+
             list_result = term_assist("list")
             assert list_result.ok
             assert session1 in list_result.stdout
@@ -424,16 +444,16 @@ class TestKill:
         try:
             # Create session
             term_cli("start", "-s", session)
-            
+
             # Verify it exists
             status = term_cli("status", "-s", session)
             assert status.ok
-            
+
             # Kill via term-assist
             result = term_assist("kill", "-s", session)
             assert result.ok
             assert session in result.stdout
-            
+
             # Verify it's gone
             status = term_cli("status", "-s", session)
             assert not status.ok
@@ -451,22 +471,22 @@ class TestKill:
         """Kill --all destroys all sessions."""
         session1 = unique_session_name()
         session2 = unique_session_name()
-        
+
         try:
             # Create two sessions
             term_cli("start", "-s", session1)
             term_cli("start", "-s", session2)
-            
+
             # Verify they exist
             assert term_cli("status", "-s", session1).ok
             assert term_cli("status", "-s", session2).ok
-            
+
             # Kill all via term-assist
             result = term_assist("kill", "-a")
             assert result.ok
             assert session1 in result.stdout
             assert session2 in result.stdout
-            
+
             # Verify they're gone
             assert not term_cli("status", "-s", session1).ok
             assert not term_cli("status", "-s", session2).ok
@@ -507,23 +527,45 @@ class TestAttachPreservesSize:
     def _get_window_size(self, tmux_socket: str, session: str) -> str:
         """Return 'WxH' for a session's first window."""
         res = subprocess.run(
-            ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", f"={session}:",
-             "#{window_width}x#{window_height}"],
-            capture_output=True, text=True,
+            [
+                "tmux",
+                "-L",
+                tmux_socket,
+                "display-message",
+                "-p",
+                "-t",
+                f"={session}:",
+                "#{window_width}x#{window_height}",
+            ],
+            capture_output=True,
+            text=True,
         )
         return res.stdout.strip()
 
     def _session_has_client(self, tmux_socket: str, session: str) -> bool:
         """Check whether session has at least one attached client."""
         res = subprocess.run(
-            ["tmux", "-L", tmux_socket, "display-message", "-p", "-t", f"={session}:",
-             "#{session_attached}"],
-            capture_output=True, text=True,
+            [
+                "tmux",
+                "-L",
+                tmux_socket,
+                "display-message",
+                "-p",
+                "-t",
+                f"={session}:",
+                "#{session_attached}",
+            ],
+            capture_output=True,
+            text=True,
         )
         return res.stdout.strip() not in ("", "0")
 
     def test_attach_preserves_agent_dimensions(
-        self, tmux_socket: str, session_factory, term_cli, term_assist,
+        self,
+        tmux_socket: str,
+        session_factory,
+        term_cli,
+        term_assist,
     ):
         """term-assist attach must not resize the agent's session.
 
@@ -541,7 +583,9 @@ class TestAttachPreservesSize:
         # Run term-assist attach inside the helper (TMUX='' bypasses nesting guard)
         term_assist_path = str(TERM_ASSIST)
         term_cli(
-            "run", "-s", helper,
+            "run",
+            "-s",
+            helper,
             f"TMUX='' {sys.executable} {term_assist_path}"
             f" -L {tmux_socket} attach -s {target}",
         )
@@ -554,8 +598,9 @@ class TestAttachPreservesSize:
             ), "term-assist attach did not register a client on target"
 
             # The target must retain its original dimensions
-            assert self._get_window_size(tmux_socket, target) == "120x40", \
+            assert self._get_window_size(tmux_socket, target) == "120x40", (
                 "term-assist attach resized the agent's session"
+            )
         finally:
             # Detach the inner tmux client, then kill helper
             term_cli("send-key", "-s", helper, "C-b")
@@ -564,7 +609,11 @@ class TestAttachPreservesSize:
             term_cli("kill", "-s", helper, "-f")
 
     def test_multiple_sessions_independent_after_attach(
-        self, tmux_socket: str, session_factory, term_cli, term_assist,
+        self,
+        tmux_socket: str,
+        session_factory,
+        term_cli,
+        term_assist,
     ):
         """Attaching to one session must not affect another session's size.
 
@@ -580,7 +629,9 @@ class TestAttachPreservesSize:
         # Attach helper to target (sets per-session window-size manual)
         term_assist_path = str(TERM_ASSIST)
         term_cli(
-            "run", "-s", helper,
+            "run",
+            "-s",
+            helper,
             f"TMUX='' {sys.executable} {term_assist_path}"
             f" -L {tmux_socket} attach -s {target}",
         )
@@ -594,8 +645,9 @@ class TestAttachPreservesSize:
             # Create a NEW session while target has window-size manual.
             # This must not crash (3.6a) or get wrong size (next-3.7).
             new_session = session_factory(cols=80, rows=24)
-            assert self._get_window_size(tmux_socket, new_session) == "80x24", \
+            assert self._get_window_size(tmux_socket, new_session) == "80x24", (
                 "New session got wrong size while another session has window-size manual"
+            )
 
             # Target must be unaffected
             assert self._get_window_size(tmux_socket, target) == "100x30"
@@ -606,7 +658,11 @@ class TestAttachPreservesSize:
             term_cli("kill", "-s", helper, "-f")
 
     def test_window_size_manual_survives_detach(
-        self, tmux_socket: str, session_factory, term_cli, term_assist,
+        self,
+        tmux_socket: str,
+        session_factory,
+        term_cli,
+        term_assist,
     ) -> None:
         """window-size manual must persist after term-assist detach.
 
@@ -623,17 +679,27 @@ class TestAttachPreservesSize:
 
         # Verify window-size manual is set by cmd_start
         res = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-qv", "-t", f"={target}:",
-             "window-size"],
-            capture_output=True, text=True,
+            [
+                "tmux",
+                "-L",
+                tmux_socket,
+                "show-option",
+                "-qv",
+                "-t",
+                f"={target}:",
+                "window-size",
+            ],
+            capture_output=True,
+            text=True,
         )
-        assert res.stdout.strip() == "manual", \
-            "cmd_start should set window-size manual"
+        assert res.stdout.strip() == "manual", "cmd_start should set window-size manual"
 
         # Attach helper to target
         term_assist_path = str(TERM_ASSIST)
         term_cli(
-            "run", "-s", helper,
+            "run",
+            "-s",
+            helper,
             f"TMUX='' {sys.executable} {term_assist_path}"
             f" -L {tmux_socket} attach -s {target}",
         )
@@ -652,13 +718,24 @@ class TestAttachPreservesSize:
 
         # After detach, window-size manual must still be set
         res = subprocess.run(
-            ["tmux", "-L", tmux_socket, "show-option", "-qv", "-t", f"={target}:",
-             "window-size"],
-            capture_output=True, text=True,
+            [
+                "tmux",
+                "-L",
+                tmux_socket,
+                "show-option",
+                "-qv",
+                "-t",
+                f"={target}:",
+                "window-size",
+            ],
+            capture_output=True,
+            text=True,
         )
-        assert res.stdout.strip() == "manual", \
+        assert res.stdout.strip() == "manual", (
             "term-assist detach must not remove window-size manual"
+        )
 
         # And the size must be unchanged
-        assert self._get_window_size(tmux_socket, target) == "100x30", \
+        assert self._get_window_size(tmux_socket, target) == "100x30", (
             "Session was resized after term-assist detach"
+        )

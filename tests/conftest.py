@@ -10,6 +10,7 @@ is derived from the test file name + a unique ID.
 from __future__ import annotations
 
 import atexit
+import os
 import shutil
 import subprocess
 import time
@@ -32,10 +33,11 @@ _sockets_to_cleanup: set[str] = set()
 @dataclass
 class RunResult:
     """Result of running term-cli."""
+
     returncode: int
     stdout: str
     stderr: str
-    
+
     @property
     def ok(self) -> bool:
         return self.returncode == 0
@@ -52,15 +54,26 @@ def unique_session_name() -> str:
     return f"test_{uuid.uuid4().hex[:8]}"
 
 
-def cleanup_session(tmux_socket: str, name: str, term_cli: Callable[..., RunResult]) -> None:
+def cleanup_session(
+    tmux_socket: str, name: str, term_cli: Callable[..., RunResult]
+) -> None:
     """Clean up a session before killing it.
-    
+
     This handles:
     1. Unlocking the session (in case test locked it via term-assist)
     2. Killing the session
     """
     subprocess.run(
-        ["tmux", "-L", tmux_socket, "set-option", "-t", f"={name}:", "-u", "@term_cli_agent_locked"],
+        [
+            "tmux",
+            "-L",
+            tmux_socket,
+            "set-option",
+            "-t",
+            f"={name}:",
+            "-u",
+            "@term_cli_agent_locked",
+        ],
         capture_output=True,
     )
     term_cli("kill", "-s", name)
@@ -94,32 +107,32 @@ atexit.register(_cleanup_all_sockets)
 def tmux_socket(request: pytest.FixtureRequest) -> Generator[str, None, None]:
     """
     Module-scoped fixture providing an isolated tmux socket.
-    
+
     Each test module gets its own tmux server, preventing parallel
     pytest-xdist workers from interfering with each other.
-    
+
     Creates a keepalive session to prevent the server from exiting when
     test sessions are cleaned up between tests.
     """
     # Get test module name for readable socket names
     # request.path is the modern API (pytest 7+), fspath is deprecated
-    if hasattr(request, 'path') and request.path:
+    if hasattr(request, "path") and request.path:
         module_name = request.path.stem
     else:
         module_name = "test"
     socket_name = f"pytest_{module_name}_{uuid.uuid4().hex[:8]}"
-    
+
     _register_socket_cleanup(socket_name)
-    
+
     # Create a keepalive session to prevent server from exiting when
     # all test sessions are killed between tests
     subprocess.run(
         ["tmux", "-L", socket_name, "new-session", "-d", "-s", "_keepalive"],
         capture_output=True,
     )
-    
+
     yield socket_name
-    
+
     # Kill the tmux server when the module is done
     _cleanup_socket(socket_name)
     _sockets_to_cleanup.discard(socket_name)
@@ -129,14 +142,15 @@ def tmux_socket(request: pytest.FixtureRequest) -> Generator[str, None, None]:
 def term_cli(tmux_socket: str) -> Callable[..., RunResult]:
     """
     Fixture providing a helper function to run term-cli commands.
-    
+
     All commands automatically use the isolated tmux socket for this test module.
-    
+
     Usage:
         result = term_cli("start", "-s", "mysession")
         assert result.ok
         assert "Created" in result.stdout
     """
+
     def run(*args: str, check: bool = False, timeout: float = 30.0) -> RunResult:
         # Prepend socket option to all commands
         full_args = ["-L", tmux_socket, *args]
@@ -158,6 +172,7 @@ def term_cli(tmux_socket: str) -> Callable[..., RunResult]:
                 f"stderr: {result.stderr}"
             )
         return run_result
+
     return run
 
 
@@ -165,36 +180,44 @@ def term_cli(tmux_socket: str) -> Callable[..., RunResult]:
 def term_assist(tmux_socket: str) -> Callable[..., RunResult]:
     """
     Fixture providing a helper function to run term-assist commands.
-    
+
     Uses the same isolated tmux socket as term_cli for this test module.
-    
+
     Usage:
         result = term_assist("done", "-s", "mysession")
         assert result.ok
     """
     import sys
+
     def run(*args: str, timeout: float = 30.0) -> RunResult:
         # Prepend socket option to all commands
         full_args = ["-L", tmux_socket, *args]
+        # Strip TMUX so the fixture behaves as "outside tmux" even when
+        # the test runner itself is inside a term-cli / tmux session.
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
         result = subprocess.run(
             [sys.executable, str(TERM_ASSIST), *full_args],
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
         return RunResult(
             returncode=result.returncode,
             stdout=result.stdout,
             stderr=result.stderr,
         )
+
     return run
 
 
 @pytest.fixture
-def session(term_cli: Callable[..., RunResult], tmux_socket: str) -> Generator[str, None, None]:
+def session(
+    term_cli: Callable[..., RunResult], tmux_socket: str
+) -> Generator[str, None, None]:
     """
     Fixture that creates a unique session and cleans it up after the test.
-    
+
     Usage:
         def test_something(session, term_cli):
             term_cli("run", "-s", session, "echo hello")
@@ -203,31 +226,33 @@ def session(term_cli: Callable[..., RunResult], tmux_socket: str) -> Generator[s
     result = term_cli("start", "-s", name)
     if not result.ok:
         pytest.fail(f"Failed to create session '{name}': {result.stderr}")
-    
+
     # Wait for shell prompt to be ready before yielding
     # Use 30s timeout to handle system load during parallel test execution
     wait_result = term_cli("wait", "-s", name, "-t", "30")
     if not wait_result.ok:
         pytest.fail(f"Shell prompt not ready in session '{name}': {wait_result.stderr}")
-    
+
     yield name
-    
+
     cleanup_session(tmux_socket, name, term_cli)
 
 
 @pytest.fixture
-def session_factory(term_cli: Callable[..., RunResult], tmux_socket: str) -> Generator[Callable[..., str], None, None]:
+def session_factory(
+    term_cli: Callable[..., RunResult], tmux_socket: str
+) -> Generator[Callable[..., str], None, None]:
     """
     Fixture that provides a factory to create multiple sessions.
     All created sessions are cleaned up after the test.
-    
+
     Usage:
         def test_multiple_sessions(session_factory, term_cli):
             s1 = session_factory()
             s2 = session_factory(cols=120, rows=40)
     """
     created_sessions: list[str] = []
-    
+
     def create(
         name: str | None = None,
         cols: int | None = None,
@@ -242,22 +267,24 @@ def session_factory(term_cli: Callable[..., RunResult], tmux_socket: str) -> Gen
             args.extend(["-y", str(rows)])
         if cwd is not None:
             args.extend(["-c", cwd])
-        
+
         result = term_cli(*args)
         if not result.ok:
             pytest.fail(f"Failed to create session '{session_name}': {result.stderr}")
-        
+
         # Wait for shell prompt to be ready
         # Use 30s timeout to handle system load during parallel test execution
         wait_result = term_cli("wait", "-s", session_name, "-t", "30")
         if not wait_result.ok:
-            pytest.fail(f"Shell prompt not ready in session '{session_name}': {wait_result.stderr}")
-        
+            pytest.fail(
+                f"Shell prompt not ready in session '{session_name}': {wait_result.stderr}"
+            )
+
         created_sessions.append(session_name)
         return session_name
-    
+
     yield create
-    
+
     # Cleanup all created sessions
     for name in created_sessions:
         cleanup_session(tmux_socket, name, term_cli)
@@ -324,7 +351,9 @@ def wait_for_idle(
     timeout: float = 5.0,
 ) -> bool:
     """Wait for terminal output to stop changing."""
-    result = term_cli("wait-idle", "-s", session, "-i", str(idle_seconds), "-t", str(timeout))
+    result = term_cli(
+        "wait-idle", "-s", session, "-i", str(idle_seconds), "-t", str(timeout)
+    )
     return result.ok
 
 
@@ -372,8 +401,11 @@ def wait_for_file_content(
 def pytest_configure(config: pytest.Config) -> None:
     """Verify tmux is available before running tests."""
     if shutil.which("tmux") is None:
-        raise pytest.UsageError("tmux is required to run tests but was not found on PATH")
+        raise pytest.UsageError(
+            "tmux is required to run tests but was not found on PATH"
+        )
     # Register the serial marker
     config.addinivalue_line(
-        "markers", "serial: mark test that uses global tmux state (run separately from parallel tests)"
+        "markers",
+        "serial: mark test that uses global tmux state (run separately from parallel tests)",
     )

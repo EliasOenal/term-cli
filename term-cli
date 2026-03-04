@@ -1557,7 +1557,8 @@ def cmd_download_pipe(src, checkpoint_lines):
     """Download via stdout (for pipe-pane capture).  Outputs framed base64."""
     _enter_alt()
     try:
-        data = open(src, 'rb').read()
+        with open(src, 'rb') as f:
+            data = f.read()
     except (OSError, IOError) as e:
         _die('read failed: ' + str(e))
 
@@ -1619,7 +1620,8 @@ def cmd_download_chunked(src, chunk_size):
     """
     _enter_alt()
     try:
-        raw_data = open(src, 'rb').read()
+        with open(src, 'rb') as f:
+            raw_data = f.read()
     except (OSError, IOError) as e:
         _die('read failed: ' + str(e))
 

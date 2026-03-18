@@ -643,6 +643,8 @@ class TestCursorAtPromptUnit:
             ("host% ", 6, "zsh with hostname"),
             ("(venv) $ ", 9, "virtualenv bash"),
             ("(base) % ", 9, "conda zsh"),
+            ("❯ ", 2, "starship default"),
+            ("~/projects ❯ ", 13, "starship with path"),
         ],
     )
     def test_detects_shell_prompts(self, cursor_at_prompt, line, cursor_x, desc):

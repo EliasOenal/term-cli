@@ -118,7 +118,7 @@ POLL_INTERVAL_MAX = 0.5          # Maximum poll interval (caps gradual increase)
 POLL_INTERVAL_MULTIPLIER = 1.2   # Factor to increase poll interval each iteration
 
 # Prompt detection configuration
-PROMPT_CHARS = frozenset('$%#>):')  # Characters that indicate end of prompt
+PROMPT_CHARS = frozenset('$%#>):❯')  # Characters that indicate end of prompt
 STABILITY_SAMPLES = 3                 # Number of samples for stability check
 STABILITY_INTERVAL = 0.1              # Interval between stability samples (100ms)
 

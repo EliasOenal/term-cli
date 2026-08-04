@@ -1,6 +1,8 @@
 name: Tests
 
-on: [push]
+on:
+  push:
+    branches: ["**"]
 
 jobs:
   test:
@@ -31,6 +33,10 @@ jobs:
       if: runner.os == 'macOS'
       timeout-minutes: 10
       run: brew install tmux htop mc
+    - name: Show tool versions
+      run: |
+        tmux -V
+        htop --version
     - name: Install test dependencies
       timeout-minutes: 10
       run: pip install -r requirements-test.txt

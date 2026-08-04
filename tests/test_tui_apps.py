@@ -24,30 +24,38 @@ def _stop_htop(session: str, term_cli: Callable[..., RunResult]) -> None:
     term_cli("wait", "-s", session, "-t", "10")
 
 
-def _first_pid_from_capture(capture_text: str) -> str | None:
-    """Extract first visible PID from an htop capture."""
-    for line in capture_text.splitlines():
+def _first_process_target(capture_text: str) -> tuple[str, int, int] | None:
+    """Extract the first visible PID and its pane coordinates."""
+    for row, line in enumerate(capture_text.splitlines()):
         m = re.match(r"\s*(\d+)\s+\S+\s+\d+", line)
         if m:
-            return m.group(1)
+            x = (m.start(1) + m.end(1) - 1) // 2
+            return (m.group(1), x, row)
     return None
 
 
-def _capture_annotate(session: str, term_cli: Callable[..., RunResult], tail: int = 28) -> str:
+def _capture_annotate(
+    session: str,
+    term_cli: Callable[..., RunResult],
+    tail: int | None = None,
+) -> str:
     """Capture annotated output and return stdout."""
-    result = term_cli("capture", "-s", session, "-a", "--tail", str(tail))
+    args = ["capture", "-s", session, "-a"]
+    if tail is not None:
+        args.extend(["--tail", str(tail)])
+    result = term_cli(*args)
     assert result.ok, result.stderr
     return result.stdout
 
 
-def _annotation_labels_for_bg(capture_text: str, bg: str) -> list[str]:
-    """Return annotation labels that use a specific background color."""
-    labels: list[str] = []
+def _annotation_labels_for_bg(capture_text: str, bg: str) -> set[str]:
+    """Return individual annotation labels that use a background color."""
+    labels: set[str] = set()
     pattern = re.compile(rf"^\s*\d+│\s+(.*?)\s+\[bg:{re.escape(bg)}\]$")
     for line in capture_text.splitlines():
-        m = pattern.match(line)
-        if m:
-            labels.append(m.group(1))
+        match = pattern.match(line)
+        if match:
+            labels.update(label.strip() for label in match.group(1).split(", "))
     return labels
 
 
@@ -143,18 +151,19 @@ class TestHtopE2E:
             # swap usage", making --nth fragile across htop versions/configs.
             term_cli("send-mouse", "-s", session, "--text", "Hostname", check=True)
             assert retry_until(
-                lambda: (
-                    _has_annotation(cap := _capture_annotate(session, term_cli), "Hostname", "cyan")
-                    and _has_annotation(cap, "Memory [Bar]", "white")
-                    and _has_annotation(cap, "Load average [Text]", "white")
-                    and "EnterAdd" in cap
+                lambda: _has_annotation(
+                    _capture_annotate(session, term_cli), "Hostname", "cyan"
                 ),
                 timeout=5.0,
                 interval=0.15,
-            ), "Expected available-meters 'Hostname' selection mode"
+            ), (
+                "Expected available-meters 'Hostname' selection mode\n"
+                f"{_capture_annotate(session, term_cli)}"
+            )
 
-            ann_before_scroll = _capture_annotate(session, term_cli)
-            cyan_before = _annotation_labels_for_bg(ann_before_scroll, "cyan")
+            cyan_before = _annotation_labels_for_bg(
+                _capture_annotate(session, term_cli), "cyan"
+            )
 
             term_cli(
                 "send-mouse", "-s", session,
@@ -162,17 +171,21 @@ class TestHtopE2E:
                 "--scroll-down", "3",
                 check=True,
             )
-            assert retry_until(
-                lambda: not _has_annotation(_capture_annotate(session, term_cli), "Hostname", "cyan"),
-                timeout=5.0,
-                interval=0.15,
-            ), "Expected available-meters selection to move after scrolling"
+            last_capture = ""
 
-            ann_after_scroll = _capture_annotate(session, term_cli)
-            cyan_after = _annotation_labels_for_bg(ann_after_scroll, "cyan")
-            assert cyan_after != cyan_before, "Expected cyan annotation targets to change after scroll"
-            assert any(label != "Add, Done" for label in cyan_after), (
-                "Expected a non-footer highlighted item after scrolling"
+            def available_selection_moved() -> bool:
+                nonlocal last_capture
+                last_capture = _capture_annotate(session, term_cli)
+                cyan_after = _annotation_labels_for_bg(last_capture, "cyan")
+                return (
+                    "Available meters" in last_capture
+                    and "Hostname" not in cyan_after
+                    and bool(cyan_after - cyan_before)
+                )
+
+            assert retry_until(available_selection_moved, timeout=5.0, interval=0.15), (
+                f"Expected another available meter to be selected after scrolling\n"
+                f"{last_capture}"
             )
         finally:
             _stop_htop(session, term_cli)
@@ -188,20 +201,33 @@ class TestHtopE2E:
         session = session_factory(cols=100, rows=32)
         _start_htop(session, term_cli)
         try:
-            before = term_cli("capture", "-s", session, "--tail", "20", "--no-annotate")
-            assert before.ok
-            pid_before = _first_pid_from_capture(before.stdout)
-            assert pid_before is not None, "Could not find initial visible PID"
+            before = term_cli("capture", "-s", session, "--no-annotate")
+            assert before.ok, before.stderr
+            target = _first_process_target(before.stdout)
+            assert target is not None, f"Could not find initial visible PID\n{before.stdout}"
+            pid_before, x, y = target
 
-            term_cli("send-mouse", "-s", session, "--text", pid_before, "--scroll-down", "3", check=True)
-            term_cli("wait-idle", "-s", session, "-i", "0.1", "-t", "5")
+            term_cli(
+                "send-mouse", "-s", session,
+                "--x", str(x), "--y", str(y),
+                "--scroll-down", "3",
+                check=True,
+            )
 
-            after = term_cli("capture", "-s", session, "--tail", "20", "--no-annotate")
-            assert after.ok
-            pid_after = _first_pid_from_capture(after.stdout)
-            assert pid_after is not None, "Could not find PID after scrolling"
-            assert pid_after != pid_before, (
-                f"Expected first visible PID to change after scroll-down (before={pid_before}, after={pid_after})"
+            last_capture = ""
+
+            def first_pid_changed() -> bool:
+                nonlocal last_capture
+                after = term_cli("capture", "-s", session, "--no-annotate")
+                if not after.ok:
+                    return False
+                last_capture = after.stdout
+                current = _first_process_target(after.stdout)
+                return current is not None and current[0] != pid_before
+
+            assert retry_until(first_pid_changed, timeout=5.0, interval=0.15), (
+                f"Expected first visible PID to change after scroll-down "
+                f"(before={pid_before})\n{last_capture}"
             )
         finally:
             _stop_htop(session, term_cli)

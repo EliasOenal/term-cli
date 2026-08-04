@@ -306,6 +306,15 @@ class TestStart:
         assert not result.ok
         assert "does not exist" in result.stderr.lower()
 
+    @pytest.mark.parametrize(
+        "name", ["", "bad:name", "$bad", "bad name", "bad#name", "bad.name"]
+    )
+    def test_start_rejects_unsafe_session_names(self, term_assist, name):
+        """Session names cannot contain tmux target or shell syntax."""
+        result = term_assist("start", "-s", name)
+        assert result.returncode == 2
+        assert "Session name must contain only" in result.stderr
+
 
 class TestAttachSessionResolution:
     """Tests for attach command's session resolution logic.

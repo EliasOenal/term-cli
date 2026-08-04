@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y tmux htop mc
+      - name: Install test dependencies
+        run: pip install -r requirements-test.txt
+      - name: Verify tag and embedded versions
+        id: version
+        run: |
+          version=$(cat VERSION)
+          test "$GITHUB_REF_NAME" = "v$version"
+          test "$(./term-cli --version)" = "term-cli $version"
+          test "$(./term-assist --version)" = "term-assist $version"
+          core=${version%%+*}
+          if [[ "$core" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run checks
+        run: |
+          pyright
+          ./run-tests.sh
+      - name: Build release assets
+        run: |
+          version=$(cat VERSION)
+          mkdir -p dist/skills/term-cli
+          cp term-cli term-assist install.sh LICENSE dist/
+          cp skills/term-cli/SKILL.md dist/skills/term-cli/
+          sed -i "s|EliasOenal/term-cli/main|EliasOenal/term-cli/$GITHUB_REF_NAME|" dist/install.sh
+          tar -czf "dist/term-cli-$version.tar.gz" -C dist \
+            term-cli term-assist install.sh LICENSE skills
+          cd dist
+          sha256sum term-cli term-assist install.sh "term-cli-$version.tar.gz" > SHA256SUMS
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ steps.version.outputs.prerelease }}
+          files: |
+            dist/term-cli
+            dist/term-assist
+            dist/install.sh
+            dist/term-cli-*.tar.gz
+            dist/SHA256SUMS

@@ -106,11 +106,13 @@ from typing import Any
 
 DEFAULT_COLS = 80
 DEFAULT_ROWS = 24
+__version__ = "1.0.0"
 DEFAULT_HISTORY_LIMIT = 50000
 DEFAULT_WAIT_TIMEOUT = 10.0
 DEFAULT_IDLE_SECONDS = 2.0
 DEFAULT_IDLE_TIMEOUT = 10.0
 DEFAULT_REQUEST_TIMEOUT = 300.0
+SESSION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Polling configuration for wait operations
 POLL_INTERVAL_INITIAL = 0.1      # Starting poll interval in seconds
@@ -248,7 +250,16 @@ def _exact(session: str) -> str:
     commands (``capture-pane``, ``send-keys``).  Without it, pane commands
     fail with "can't find pane: =name".
     """
+    _validate_session_name(session)
     return f"={session}:"
+
+
+def _validate_session_name(session: str) -> None:
+    """Reject names that tmux may parse as target syntax."""
+    if not SESSION_NAME_RE.fullmatch(session):
+        raise ValueError(
+            "Session name must contain only ASCII letters, digits, '-', and '_'"
+        )
 
 def _session_exists(session: str) -> bool:
     res = _run_tmux(["has-session", "-t", _exact(session)])
@@ -2470,6 +2481,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 def cmd_start(args: argparse.Namespace) -> None:
     session = args.session
+    _validate_session_name(session)
     if _session_exists(session):
         raise RuntimeError(f"Session '{session}' already exists (use 'kill' first to replace)")
 
@@ -2515,25 +2527,46 @@ def cmd_start(args: argparse.Namespace) -> None:
     if not res.ok:
         raise RuntimeError(res.stderr.strip() or "Failed to start session")
 
+    setup_commands: list[tuple[list[str], str]] = []
+
     # Workaround: some tmux versions ignore -x/-y on new-session -d when
     # window-size is manual, so enforce size with resize-window after creation.
     if not args.no_size:
-        _run_tmux(["resize-window", "-t", _exact(session), "-x", str(cols), "-y", str(rows)])
+        setup_commands.append((
+            ["resize-window", "-t", _exact(session), "-x", str(cols), "-y", str(rows)],
+            "set session size",
+        ))
 
     # Pin window size so tmux never resizes it based on attached clients.
     # Agent-managed sessions should only be resized explicitly via
     # ``term-cli resize``.  Without this, tmux's global window-size policy
     # (default: "latest") would resize the window whenever a client
     # attaches to *any* session on the same server.
-    _run_tmux(["set-option", "-t", _exact(session), "window-size", "manual"])
+    setup_commands.append((
+        ["set-option", "-t", _exact(session), "window-size", "manual"],
+        "pin window size",
+    ))
 
     # Increase scrollback buffer so agents don't lose important output.
     # tmux default is 2000 lines which is easily exceeded by verbose builds.
-    _run_tmux(["set-option", "-t", _exact(session), "history-limit", str(DEFAULT_HISTORY_LIMIT)])
+    setup_commands.append((
+        ["set-option", "-t", _exact(session), "history-limit", str(DEFAULT_HISTORY_LIMIT)],
+        "set history limit",
+    ))
 
     # Set locked flag if requested
     if args.locked:
-        _set_locked(session)
+        setup_commands.append((
+            ["set-option", "-t", _exact(session), TERM_CLI_LOCKED_OPT, "1"],
+            "lock session",
+        ))
+
+    for command, action in setup_commands:
+        setup = _run_tmux(command)
+        if not setup.ok:
+            _run_tmux(["kill-session", "-t", _exact(session)])
+            detail = setup.stderr.strip() or action
+            raise RuntimeError(f"Failed to configure session '{session}': {detail}")
 
     size_info = f" ({cols}x{rows})" if not args.no_size else ""
     cwd_info = f" in {args.cwd}" if args.cwd else ""
@@ -3897,6 +3930,7 @@ Note: Use single quotes for -m messages with shell special chars: -m 'Done! $var
     )
     
     # Global options (before subcommands)
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("-L", "--socket-name", metavar="NAME",
                    help="Use a different tmux socket (for isolated servers)")
     

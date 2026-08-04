@@ -229,22 +229,14 @@ class TestStart:
         finally:
             term_cli("kill", "-s", name)
 
-    def test_start_session_name_special_chars(self, term_cli):
-        """Session names with colons are sanitized by tmux."""
-        # tmux replaces certain characters (like colons) with underscores
-        # because colons are used as separators in tmux target syntax
-        name_with_colons = "test_special:char:session"
-        expected_name = "test_special_char_session"  # colons become underscores
-
-        result = term_cli("start", "-s", name_with_colons)
-        assert result.ok
-
-        # The session is created with sanitized name
-        list_result = term_cli("list")
-        assert expected_name in list_result.stdout
-
-        # Clean up with the actual name tmux used
-        term_cli("kill", "-s", expected_name)
+    @pytest.mark.parametrize(
+        "name", ["", "bad:name", "$bad", "bad name", "bad#name", "bad.name"]
+    )
+    def test_start_rejects_unsafe_session_names(self, term_cli, name):
+        """Session names cannot contain tmux target or shell syntax."""
+        result = term_cli("start", "-s", name)
+        assert result.returncode == 2
+        assert "Session name must contain only" in result.stderr
 
 
 class TestKill:

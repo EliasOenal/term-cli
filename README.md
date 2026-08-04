@@ -20,7 +20,7 @@ Hand control to humans for passwords and MFA prompts. Or flip it: human drives w
 - **term-cli**: Agents run interactive programs in detached terminal sessions (tmux-backed)
 - **term-assist**: Humans collaborate, enter passwords, handle MFA, prepare sessions
 
-Single-file Python. No dependencies beyond tmux. 680+ tests, CI on every commit. BSD licensed.
+Single-file Python. No dependencies beyond tmux. 700+ tests, CI on every commit. BSD licensed.
 
 ## The Problem
 
@@ -90,8 +90,8 @@ Requires Python 3.8+ and tmux.
 brew install tmux        # macOS
 apt install tmux         # Debian/Ubuntu
 
-# Install term-cli, term-assist, and agent skill files
-curl -fsSL https://raw.githubusercontent.com/EliasOenal/term-cli/main/install.sh | bash
+# Install the latest stable term-cli, term-assist, and agent skill files
+curl -fsSL https://github.com/EliasOenal/term-cli/releases/latest/download/install.sh | bash
 ```
 
 Or from a cloned repo:
@@ -126,8 +126,8 @@ git clone https://github.com/EliasOenal/term-cli.git && cd term-cli && ./install
 <summary>Manual installation</summary>
 
 ```bash
-curl -O https://raw.githubusercontent.com/EliasOenal/term-cli/main/term-cli
-curl -O https://raw.githubusercontent.com/EliasOenal/term-cli/main/term-assist
+curl -LO https://github.com/EliasOenal/term-cli/releases/latest/download/term-cli
+curl -LO https://github.com/EliasOenal/term-cli/releases/latest/download/term-assist
 chmod +x term-cli term-assist
 ```
 
@@ -204,6 +204,8 @@ Works with **Claude Code**, **Gemini CLI**, **Cursor**, **Aider**, **OpenCode**,
 | `request-wait --session NAME` | Wait for human to complete |
 | `request-status --session NAME` | Check if request pending |
 | `request-cancel --session NAME` | Cancel pending request |
+
+Session names may contain ASCII letters, digits, dashes, and underscores.
 
 Run `term-cli --help` or `term-cli <command> --help` for details.
 
@@ -328,6 +330,13 @@ term-cli kill --session prod
 - **Two tools**: term-cli for agents, term-assist for humans
 - **Single files**: No dependencies beyond Python stdlib + tmux
 - **Self-documenting**: Point at `--help` and go
+
+## Versioning
+
+term-cli follows Semantic Versioning. Run `term-cli --version` or
+`term-assist --version` to identify an installation. Releases and their notes
+are available on [GitHub](https://github.com/EliasOenal/term-cli/releases); the
+maintainer process is documented in [RELEASING.md](RELEASING.md).
 
 ## Requirements
 

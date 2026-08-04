@@ -1153,7 +1153,7 @@ class TestAnnotationUnit:
             raise RuntimeError(f"Failed to load module spec for {term_cli_path}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        loader.exec_module(module)
         return module
 
     @pytest.fixture(scope="class")

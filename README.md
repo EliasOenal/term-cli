@@ -3,6 +3,10 @@
   <img src="assets/challenge.webp" alt="term-cli challenge demo">
 </p>
 
+<!-- yarkr:badges:start -->
+[![Indexed on Yarkr](https://api.yarkr.com/functions/v1/api/api/v1/badges/repos/EliasOenal/term-cli/version.svg)](https://yarkr.com/arks/eliasoenal/term-cli)
+<!-- yarkr:badges:end -->
+
 **term-cli: unlock interactive terminals for AI agents**
 
 If it blocks in a terminal, it blocks your agent.
@@ -175,6 +179,38 @@ mkdir -p ~/.config/opencode/skills && cp -r skills/term-cli ~/.config/opencode/s
 
 Works with **Claude Code**, **Gemini CLI**, **Cursor**, **Aider**, **OpenCode**, **Cline**, **Kilo Code**, **Windsurf**, **Amazon Q**, **Augment Code**, **Moltbot**, **OpenHands**, and any agent that can run shell commands.
 </details>
+
+<!-- yarkr:install:start -->
+## Install with Yarkr
+
+This repo is indexed on [Yarkr](https://yarkr.com/arks/eliasoenal/term-cli) as the ark [eliasoenal/term-cli](https://yarkr.com/arks/eliasoenal/term-cli), so its skills install into Claude Code, Codex, Cursor and other agent harnesses with one command.
+
+### CLI
+
+Install the whole ark, which Yarkr keeps equal to this repo:
+
+```bash
+npx yarkr-cli sync eliasoenal/term-cli
+```
+
+Or add individual skills:
+
+```bash
+npx yarkr-cli add skill:eliasoenal/term-cli/term-cli
+```
+
+No Node.js? `curl -fsSL https://yarkr.com/install.sh | sh` (macOS, Linux) or `irm https://yarkr.com/install.ps1 | iex` (Windows PowerShell) installs `yarkr` as a standalone binary; then type `yarkr` in place of `npx yarkr-cli`.
+
+### MCP
+
+Connect your agent to the ark over MCP:
+
+```bash
+npx yarkr-cli mcp add eliasoenal/term-cli
+```
+
+Or point any MCP client at `https://api.yarkr.com/functions/v1/api/mcp/o/eliasoenal/term-cli`.
+<!-- yarkr:install:end -->
 
 ## term-cli Commands (for agents)
 
